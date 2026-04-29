@@ -66,9 +66,10 @@ class JointImpedanceTracker:
 
     def _exit(self):
         if self._restore and self._prev_type is not None:
-            self._ctrl.type = self._prev_type
+            # Restore gains first, then post atomic type change.
             if self._prev_gains is not None:
                 self._ctrl._joint_gains_handle.set(self._prev_gains)
+            self._ctrl._request_type_change(self._prev_type)
         self._stopped = True
 
     # Sync context manager
@@ -145,9 +146,10 @@ class CartesianImpedanceTracker:
 
     def _exit(self):
         if self._restore and self._prev_type is not None:
-            self._ctrl.type = self._prev_type
+            # Restore gains first, then post atomic type change.
             if self._prev_gains is not None:
                 self._ctrl._cart_gains_handle.set(self._prev_gains)
+            self._ctrl._request_type_change(self._prev_type)
         self._stopped = True
 
     # Sync context manager
@@ -214,6 +216,8 @@ class ExponentialImpedanceTracker:
         self._time_constant = max(float(time_constant), 1e-6)
         self._restore = restore_on_exit
         self._prev_type: Optional[str] = None
+        self._prev_joint_gains: Optional[JointImpedanceGains] = None
+        self._prev_cart_gains: Optional[CartesianImpedanceGains] = None
         self._stopped = False
 
         self._stiffness = stiffness
@@ -229,6 +233,11 @@ class ExponentialImpedanceTracker:
 
     def _enter(self):
         self._prev_type = self._ctrl.type
+        # Save gains for the mode we are about to use
+        if self._mode == "impedance":
+            self._prev_joint_gains = self._ctrl._joint_gains_handle.get().copy()
+        else:
+            self._prev_cart_gains = self._ctrl._cart_gains_handle.get().copy()
         self._ctrl.switch(self._mode)
 
         if self._mode == "impedance":
@@ -250,7 +259,12 @@ class ExponentialImpedanceTracker:
 
     def _exit(self):
         if self._restore and self._prev_type is not None:
-            self._ctrl.type = self._prev_type
+            # Restore gains first, then post atomic type change.
+            if self._mode == "impedance" and self._prev_joint_gains is not None:
+                self._ctrl._joint_gains_handle.set(self._prev_joint_gains)
+            elif self._mode == "osc" and self._prev_cart_gains is not None:
+                self._ctrl._cart_gains_handle.set(self._prev_cart_gains)
+            self._ctrl._request_type_change(self._prev_type)
         self._stopped = True
 
     def __enter__(self):

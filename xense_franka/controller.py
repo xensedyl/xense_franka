@@ -97,6 +97,12 @@ class FrankaController:
         self._active_joint_gains = JointImpedanceGains()
         self._active_cart_gains = CartesianImpedanceGains()
 
+        # Pending type transition consumed by the control loop.  Writing a
+        # string here (GIL-atomic) tells the loop to change ``self.type`` and
+        # reset the error integral on the *next* tick, **after** the caller has
+        # already written fresh references to the handles.
+        self._pending_transition: Optional[str] = None
+
         self.initialize()
 
     # ------------------------------------------------------------------
@@ -218,6 +224,28 @@ class FrankaController:
         )
         self._joint_ref_handle.set(joint_ref)
         self._cart_ref_handle.set(cart_ref)
+
+    def _request_type_change(self, controller_type: str):
+        """Post an atomic type transition for the control loop.
+
+        Fresh references (based on the latest robot state) are written to the
+        handles *before* the transition flag is set, so the control loop always
+        sees a consistent ``(type, reference)`` pair.
+        """
+        state = self.state if self.state is not None else self.robot.state
+        self._joint_ref_handle.set(JointReference(
+            q=state["qpos"].copy(),
+            dq=np.zeros(7, dtype=float),
+            tau_ff=np.zeros(7, dtype=float),
+        ))
+        self._cart_ref_handle.set(CartesianReference(
+            pose=state["ee"].copy(),
+            twist=np.zeros(6, dtype=float),
+            nullspace_target=state["qpos"].copy(),
+        ))
+        # GIL-atomic: the control loop will see the new type only after the
+        # handles above have been updated.
+        self._pending_transition = controller_type
 
     # ------------------------------------------------------------------
     # Public gain / reference setters
@@ -363,6 +391,16 @@ class FrankaController:
                 with self.state_lock:
                     self.state = state
                     self.last_torque = state["last_torque"].copy()
+
+                # Consume pending type transition (atomic switch).
+                # The caller has already written fresh references to the
+                # handles, so by the time we read them below the pair
+                # (type, reference) is consistent.
+                pending = self._pending_transition
+                if pending is not None:
+                    self._pending_transition = None
+                    self.type = pending
+                    self.error_integral = np.zeros(7, dtype=float)
 
                 dt = max(float(state.get("dt", 1e-3)), 1e-6)
 
@@ -585,13 +623,22 @@ class FrankaController:
         await asyncio.sleep(0)
 
     def switch(self, controller_type: str):
+        """Switch controller mode.
+
+        The type change takes effect on the **next** control-loop tick so
+        that the new mode always starts with consistent references.
+        Reading ``self.type`` immediately after this call may still return
+        the previous value for up to one control period (~1 ms).
+        """
         if controller_type not in {"impedance", "pid", "osc", "torque"}:
             raise ValueError(f"Unknown controller type: {controller_type}")
 
-        self.type = controller_type
+        # Update initial_ee / initial_qpos snapshots (user-visible)
         self.initialize()
-        self.error_integral = np.zeros(7, dtype=float)
+        # Clear user-thread rate-limit state
         self._publish_next_deadline.clear()
+        # Post atomic transition for the control loop
+        self._request_type_change(controller_type)
 
         if self.verbose:
             print("==================================")
@@ -609,7 +656,7 @@ class FrankaController:
         acc=np.ones(7, dtype=float) * 0.5,
     ):
         self._assert_loop_ok()
-        self.type = "impedance"
+        self._request_type_change("impedance")
 
         if qpos is None:
             qpos = np.array([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, 0.7853], dtype=float)

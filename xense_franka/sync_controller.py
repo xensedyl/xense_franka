@@ -59,34 +59,47 @@ class SyncFrankaController:
             pass  # 忽略控制器内部的 sys.exit
 
     def _run_async(self, coro, timeout=30.0):
-        """在事件循环中运行协程并等待结果"""
+        """在事件循环中运行协程并等待结果。
+
+        Exceptions propagate to the caller. On timeout the underlying
+        coroutine is cancelled so it does not keep running silently.
+        """
         if not self._loop or not self._loop.is_running():
-            # 如果循环没运行，尝试直接取消协程
             coro.close()
-            return None
+            raise RuntimeError("Event loop is not running")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
             return future.result(timeout=timeout)
         except Exception:
-            return None
+            future.cancel()
+            raise
 
     def start(self):
         """启动控制器和 1kHz 控制循环"""
         if self._started:
             return
-        
+
         # 创建新的事件循环和后台线程
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
-        # 初始化机器人和控制器
+        # 初始化机器人和控制器.
+        # Use run_coroutine_threadsafe directly so that exceptions propagate
+        # instead of being swallowed by _run_async.
         async def _init():
             self._robot = RobotInterface(self.robot_ip)
             self._controller = FrankaController(self._robot)
             await self._controller.start()
 
-        self._run_async(_init())
+        future = asyncio.run_coroutine_threadsafe(_init(), self._loop)
+        try:
+            future.result(timeout=30.0)
+        except Exception:
+            future.cancel()
+            # Tear down any partially-initialized controller / robot / FCI session
+            self._shutdown()
+            raise
         self._started = True
 
     def stop(self):
@@ -94,26 +107,62 @@ class SyncFrankaController:
         if not self._started:
             return
 
-        # 尝试优雅停止控制器
+        self._shutdown()
+        self._started = False
+
+    def _shutdown(self):
+        """Best-effort teardown of controller, robot, event-loop, and thread.
+
+        Follows the chain: controller.stop() → robot.stop() (fallback) →
+        loop.stop() → thread.join().  Each step is independent so a failure
+        in an earlier step never prevents later cleanup.  References are only
+        cleared after the background thread has actually exited.
+        """
         if self._loop and self._loop.is_running():
             async def _stop():
+                # Always try controller.stop() first (it calls robot.stop()
+                # internally).  If the controller was never fully constructed,
+                # or if controller.stop() fails, fall back to robot.stop()
+                # directly so the FCI session is released.
+                controller_stopped = False
                 if self._controller:
                     try:
                         await self._controller.stop()
+                        controller_stopped = True
+                    except Exception:
+                        pass
+                if not controller_stopped and self._robot:
+                    try:
+                        self._robot.stop()
                     except Exception:
                         pass
 
+            future = asyncio.run_coroutine_threadsafe(_stop(), self._loop)
             try:
-                self._run_async(_stop(), timeout=3.0)
+                future.result(timeout=3.0)
             except Exception:
-                pass
-            
-            # 停止事件循环
+                future.cancel()
+
             self._loop.call_soon_threadsafe(self._loop.stop)
-        
+
         if self._thread:
             self._thread.join(timeout=2.0)
-        self._started = False
+            if self._thread.is_alive():
+                # Thread did not exit in time.  Keep references so the
+                # caller can still inspect or retry; log a warning.
+                import warnings
+                warnings.warn(
+                    "xense_franka: background thread did not exit within "
+                    "the timeout — resources may still be in use",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                return
+
+        self._controller = None
+        self._robot = None
+        self._loop = None
+        self._thread = None
 
     def move(self, q_target: Optional[List[float]] = None):
         """
