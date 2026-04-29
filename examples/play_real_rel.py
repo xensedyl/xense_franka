@@ -64,7 +64,7 @@ Usage:
 """
 
 import argparse
-import asyncio
+import time
 import numpy as np
 import torch
 from pathlib import Path
@@ -445,11 +445,11 @@ def dry_run_policy(policy_state, state_preprocessor, device: str,
     return all_pass
 
 
-async def run_policy(policy_state, state_preprocessor, device: str,
-                     target_joints: np.ndarray, action_scales: np.ndarray,
-                     robot_ip: str, Kp: float, Kd: float,
-                     start_joints: np.ndarray = None, duration: float = 8.0):
-    """Main async control loop at exactly 50Hz.
+def run_policy(policy_state, state_preprocessor, device: str,
+               target_joints: np.ndarray, action_scales: np.ndarray,
+               robot_ip: str, Kp: float, Kd: float,
+               start_joints: np.ndarray = None, duration: float = 8.0):
+    """Main control loop at exactly 50Hz.
 
     Args:
         duration: Episode duration in seconds (default: 8.0s = 400 steps at 50Hz)
@@ -464,12 +464,12 @@ async def run_policy(policy_state, state_preprocessor, device: str,
     robot = RobotInterface(robot_ip)
     controller = FrankaController(robot)
 
-    await controller.start()
+    controller.start()
 
     # Move to start position if specified
     if start_joints is not None:
         print(f"Moving to start position: {start_joints}")
-        await controller.move(start_joints)
+        controller.move(start_joints)
 
     # Switch to impedance control with gains
     controller.switch("impedance")
@@ -537,7 +537,7 @@ async def run_policy(policy_state, state_preprocessor, device: str,
             target_action = process_action(raw_action, joint_pos, action_scales)
 
             # 6. Apply to robot - automatically waits to maintain 50Hz
-            await controller.set("q_desired", target_action)
+            controller.set("q_desired", target_action)
 
             # 7. Collect trajectory data (direct array assignment, no copy)
             commanded_poses[step] = target_action
@@ -566,7 +566,7 @@ async def run_policy(policy_state, state_preprocessor, device: str,
     except KeyboardInterrupt:
         print(f"\n\nStopped early at step {step}")
 
-    await controller.stop()
+    controller.stop()
 
     # Return trajectory data (slice to actual steps completed)
     # step+1 because step is 0-indexed, so after completing step N we have N+1 data points
@@ -656,12 +656,10 @@ def main():
                 print(f"Sampled target: {target_joints}")
 
             # Run rollout
-            commanded_poses, achieved_poses, achieved_vels, achieved_torques, goal_pose = asyncio.run(
-                run_policy(
-                    policy_state, state_preprocessor, device, target_joints,
-                    action_scales, args.robot_ip, args.Kp, args.Kd, start_joints,
-                    args.duration
-                )
+            commanded_poses, achieved_poses, achieved_vels, achieved_torques, goal_pose = run_policy(
+                policy_state, state_preprocessor, device, target_joints,
+                action_scales, args.robot_ip, args.Kp, args.Kd, start_joints,
+                args.duration
             )
 
             if len(achieved_poses) > 0:
@@ -737,12 +735,10 @@ def main():
         print(f"  save_path: {args.save_path}")
 
     # Run the control loop and get trajectory data
-    commanded_poses, achieved_poses, achieved_vels, achieved_torques, goal_pose = asyncio.run(
-        run_policy(
-            policy_state, state_preprocessor, device, target_joints,
-            action_scales, args.robot_ip, args.Kp, args.Kd, start_joints,
-            args.duration
-        )
+    commanded_poses, achieved_poses, achieved_vels, achieved_torques, goal_pose = run_policy(
+        policy_state, state_preprocessor, device, target_joints,
+        action_scales, args.robot_ip, args.Kp, args.Kd, start_joints,
+        args.duration
     )
 
     # Save data and/or plot if save_path is specified

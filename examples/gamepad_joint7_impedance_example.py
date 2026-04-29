@@ -14,7 +14,7 @@
 """
 
 import pygame
-import asyncio
+import time
 import numpy as np
 from xense_franka.robot import RobotInterface
 from xense_franka import FrankaController
@@ -37,7 +37,7 @@ def apply_deadzone(value, deadzone):
     return 0.0 if abs(value) < deadzone else value
 
 
-async def main():
+def main():
     # ========== 初始化手柄 ==========
     pygame.init()
     pygame.joystick.init()
@@ -59,12 +59,12 @@ async def main():
     robot = RobotInterface("192.168.99.111")
     controller = FrankaController(robot)
 
-    await controller.start()
+    controller.start()
 
     # 移动到初始位置
     print("移动到初始位置...")
-    await controller.move(HOME_JOINTS)
-    await asyncio.sleep(0.5)
+    controller.move(HOME_JOINTS)
+    time.sleep(0.5)
 
     # ========== 切换到关节阻抗控制 ==========
     controller.switch("impedance")
@@ -102,7 +102,7 @@ async def main():
             print("重置到初始位置...")
             with controller.state_lock:
                 controller.q_desired = initial_q.copy()
-            await asyncio.sleep(0.5)
+            time.sleep(0.5)
             continue
 
         # ---- 读取摇杆 ----
@@ -121,14 +121,14 @@ async def main():
 
         print(f"第 7 关节目标: {q_target[6]:.4f} rad  (增量: {delta:+.4f})")
 
-        await controller.set("q_desired", q_target)
+        controller.set("q_desired", q_target)
 
     # ========== 清理 ==========
     print("停止控制器...")
-    await controller.stop()
+    controller.stop()
     pygame.quit()
     print("完成!")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

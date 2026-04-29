@@ -1,26 +1,22 @@
 """
-xense_franka: Async command API for Franka torque control.
+xense_franka: Synchronous command API for Franka torque control.
 
-The public API remains async-friendly, while the 1kHz impedance loop runs in a
+The public API is synchronous, while the 1kHz impedance loop runs in a
 dedicated background thread.
 
 Main Components:
     RobotInterface: Low-level robot interface (real or simulation)
-    FrankaController: High-level asyncio controller with multiple modes
-    FrankaLockUnlock: Client for robot authentication and brake control
+    FrankaController: High-level synchronous controller with multiple modes
+    SyncFrankaController: Convenience wrapper that manages robot + controller lifecycle
 
 Quick Example:
-    >>> import asyncio
     >>> from xense_franka import RobotInterface, FrankaController
     >>>
-    >>> async def main():
-    ...     robot = RobotInterface("172.16.0.2")
-    ...     controller = FrankaController(robot)
-    ...     await controller.start()
-    ...     await controller.move()  # Move to home
-    ...     await controller.stop()
-    >>>
-    >>> asyncio.run(main())
+    >>> robot = RobotInterface("172.16.0.2")
+    >>> controller = FrankaController(robot)
+    >>> controller.start()
+    >>> controller.move()  # Move to home
+    >>> controller.stop()
 
 For detailed documentation, see README.md and USAGE_GUIDE.md
 """
@@ -48,7 +44,7 @@ from xense_franka.trackers import (
     JointImpedanceTracker,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = [
     # Core
     "RobotInterface",

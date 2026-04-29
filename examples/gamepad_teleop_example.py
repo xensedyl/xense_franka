@@ -7,14 +7,14 @@
 
 手柄映射 (Xbox 布局):
 - 左摇杆 X/Y: 末端 Y/X 平移
-- 右摇杆 Y: 末端 Z 平移  
+- 右摇杆 Y: 末端 Z 平移
 - 右摇杆 X: 末端 Z 轴旋转
 - A 按钮 (或 X): 退出程序
 - B 按钮 (或 O): 重置到初始位置
 """
 
 import pygame
-import asyncio
+import time
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from xense_franka.robot import RobotInterface
@@ -35,7 +35,7 @@ def apply_deadzone(value, deadzone):
     return 0.0 if abs(value) < deadzone else value
 
 
-async def main():
+def main():
     # ========== 初始化手柄 ==========
     # 在连接机器人前初始化，避免通信超时
     pygame.init()
@@ -61,21 +61,21 @@ async def main():
     controller = FrankaController(robot)
 
     # 启动控制器
-    await controller.start()
+    controller.start()
 
     # 移动到初始位置
     print("移动到初始位置...")
-    await controller.move(HOME_JOINTS)
-    await asyncio.sleep(0.5)
+    controller.move(HOME_JOINTS)
+    time.sleep(0.5)
 
     # ========== 切换到笛卡尔阻抗控制 ==========
     controller.switch("osc")
-    
+
     # 设置刚度和阻尼 (与官方示例一致的参数)
     # 平移刚度 600 N/m, 旋转刚度 50 Nm/rad
     controller.ee_kp = np.array([600.0, 600.0, 600.0, 50.0, 50.0, 50.0])
     controller.ee_kd = 2.0 * np.sqrt(controller.ee_kp)  # 临界阻尼
-    
+
     # 设置命令更新频率
     controller.set_freq(50)  # 50 Hz
 
@@ -100,13 +100,13 @@ async def main():
             print("\n检测到退出按钮，正在停止...")
             running = False
             continue
-        
+
         # B/O 按钮重置 (按钮 1)
         if joystick.get_button(1):
             print("重置到初始位置...")
             with controller.state_lock:
                 controller.ee_desired = initial_ee.copy()
-            await asyncio.sleep(0.5)  # 等待稳定
+            time.sleep(0.5)  # 等待稳定
             continue
 
         # ---- 读取摇杆 ----
@@ -122,7 +122,7 @@ async def main():
             lx * TRANSLATION_SPEED,  # 左摇杆 X -> Y 轴 (左右)
             -ry * TRANSLATION_SPEED,  # 右摇杆 Y -> Z 轴 (上下)
         ])
-        
+
         # 旋转: 只用 Z 轴旋转 (绕竖直轴)
         rotation_delta = R.from_euler('z', -rx * ROTATION_SPEED, degrees=True).as_matrix()
 
@@ -133,20 +133,20 @@ async def main():
 
         # 应用平移
         current_ee[:3, 3] += translation_delta
-        
+
         # 应用旋转 (左乘，在基坐标系下旋转)
         current_ee[:3, :3] = rotation_delta @ current_ee[:3, :3]
         print("目标位置:\n",current_ee)
 
         # 发送新目标
-        await controller.set("ee_desired", current_ee)
+        controller.set("ee_desired", current_ee)
 
     # ========== 清理 ==========
     print("停止控制器...")
-    await controller.stop()
+    controller.stop()
     pygame.quit()
     print("完成!")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

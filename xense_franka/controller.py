@@ -1,4 +1,3 @@
-import asyncio
 import threading
 import time
 from typing import Optional
@@ -37,12 +36,13 @@ from xense_franka.torque_utils import (
 
 class FrankaController:
     """
-    High-level Franka controller with an async command API and a dedicated
+    High-level Franka controller with a synchronous command API and a dedicated
     background real-time thread for torque control.
 
-    The async methods only publish new references or wait for motion timing.
-    The 1kHz control loop runs in a dedicated Python thread and keeps one
-    impedance controller alive, similar to franky's tracking motions.
+    The public methods publish new references or wait for motion timing using
+    plain ``time.sleep()``.  The 1kHz control loop runs in a dedicated Python
+    thread and keeps one impedance controller alive, similar to franky's
+    tracking motions.
     """
 
     def __init__(self, robot: RobotInterface):
@@ -321,12 +321,12 @@ class FrankaController:
         )
 
     # ------------------------------------------------------------------
-    # Async command API
+    # Command API
     # ------------------------------------------------------------------
 
-    async def test_connection(self):
+    def test_connection(self):
         self.track = True
-        await asyncio.sleep(5.0)
+        time.sleep(5.0)
         self.track = False
 
     def set_freq(self, freq: float):
@@ -336,7 +336,7 @@ class FrankaController:
         self._publish_dt = 1.0 / self._publish_freq
         self._publish_next_deadline.clear()
 
-    async def _rate_limit_publish(self, key: str, dt: Optional[float] = None):
+    def _rate_limit_publish(self, key: str, dt: Optional[float] = None):
         now = time.perf_counter()
         dt = self._publish_dt if dt is None else float(dt)
         deadline = self._publish_next_deadline.get(key)
@@ -344,7 +344,7 @@ class FrankaController:
             self._publish_next_deadline[key] = now + dt
             return
         if deadline > now:
-            await asyncio.sleep(deadline - now)
+            time.sleep(deadline - now)
             now = time.perf_counter()
         next_deadline = max(deadline + dt, now)
         self._publish_next_deadline[key] = next_deadline
@@ -353,9 +353,9 @@ class FrankaController:
         if self._loop_exception is not None:
             raise RuntimeError("Control loop terminated unexpectedly") from self._loop_exception
 
-    async def set(self, attr: str, value):
+    def set(self, attr: str, value):
         self._assert_loop_ok()
-        await self._rate_limit_publish(attr)
+        self._rate_limit_publish(attr)
 
         if attr == "q_desired":
             self._set_joint_reference(value)
@@ -369,14 +369,14 @@ class FrankaController:
             return
         setattr(self, attr, value)
 
-    async def set_joint_reference(self, q, dq=None, tau_ff=None):
+    def set_joint_reference(self, q, dq=None, tau_ff=None):
         self._assert_loop_ok()
-        await self._rate_limit_publish("joint_reference")
+        self._rate_limit_publish("joint_reference")
         self._set_joint_reference(q=q, dq=dq, tau_ff=tau_ff)
 
-    async def set_cartesian_reference(self, pose, twist=None, nullspace_target=None):
+    def set_cartesian_reference(self, pose, twist=None, nullspace_target=None):
         self._assert_loop_ok()
-        await self._rate_limit_publish("cartesian_reference")
+        self._rate_limit_publish("cartesian_reference")
         self._set_cartesian_reference(pose=pose, twist=twist, nullspace_target=nullspace_target)
 
     # ------------------------------------------------------------------
@@ -600,7 +600,7 @@ class FrankaController:
     # Start / stop / switch
     # ------------------------------------------------------------------
 
-    async def start(self):
+    def start(self):
         self._assert_loop_ok()
         if self.running:
             return self._thread
@@ -615,21 +615,17 @@ class FrankaController:
         self._thread.start()
 
         try:
-            start_deadline = time.time() + 2.0
-            while time.time() < start_deadline:
-                if self._ready_event.wait(timeout=0.05):
-                    self._assert_loop_ok()
-                    return self._thread
-                await asyncio.sleep(0)
-
+            if not self._ready_event.wait(timeout=2.0):
+                self._assert_loop_ok()
+                raise TimeoutError("Timed out waiting for control loop to start")
             self._assert_loop_ok()
-            raise TimeoutError("Timed out waiting for control loop to start")
+            return self._thread
         except BaseException:
             # Roll back: stop the control thread and release the FCI session.
-            await self.stop()
+            self.stop()
             raise
 
-    async def stop(self):
+    def stop(self):
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
@@ -646,12 +642,18 @@ class FrankaController:
                 )
                 self._thread = None
                 self.running = False
-                await asyncio.sleep(0)
                 return
             self._thread = None
         self.running = False
         self.robot.stop()
-        await asyncio.sleep(0)
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        return False
 
     def switch(self, controller_type: str):
         """Switch controller mode.
@@ -680,7 +682,7 @@ class FrankaController:
     # Motion
     # ------------------------------------------------------------------
 
-    async def move(
+    def move(
         self,
         qpos=None,
         vel=np.ones(7, dtype=float) * 0.1,
@@ -719,7 +721,7 @@ class FrankaController:
         for step in range(steps + 1):
             t = min(step * sample_dt, trajectory.duration)
             q_ref, dq_ref, _ = trajectory.at_time(t)
-            await self._rate_limit_publish("move_joint_reference", dt=sample_dt)
+            self._rate_limit_publish("move_joint_reference", dt=sample_dt)
             self._set_joint_reference(q=q_ref, dq=dq_ref)
 
         self._set_joint_reference(q=inp.target_position, dq=np.zeros(7, dtype=float))

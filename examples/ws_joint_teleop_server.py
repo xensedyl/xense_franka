@@ -49,9 +49,9 @@ class JointTeleopServer:
         self.robot = RobotInterface(self.robot_ip)
         self.controller = FrankaController(self.robot)
 
-        await self.controller.start()
+        self.controller.start()
         # 移动到初始位姿
-        await self.controller.move(HOME_JOINTS, vel=np.ones(7)*0.1, acc=np.ones(7)*0.5)
+        self.controller.move(HOME_JOINTS, vel=np.ones(7)*0.1, acc=np.ones(7)*0.5)
         await asyncio.sleep(1.0)
 
         # 切换到关节阻抗控制
@@ -91,7 +91,7 @@ class JointTeleopServer:
 
         if cmd_type == "reset":
             print("[Server] 重置到初始关节位置...")
-            await self.controller.set("q_desired", self.initial_q.copy())
+            self.controller.set("q_desired", self.initial_q.copy())
             await asyncio.sleep(0.5)  # 等待稳定
             return
 
@@ -99,7 +99,7 @@ class JointTeleopServer:
             q = np.array(cmd["q_desired"], dtype=np.float64)
             # 限位保护
             q = np.clip(q, JOINT_LIMITS_MIN, JOINT_LIMITS_MAX)
-            await self.controller.set("q_desired", q)
+            self.controller.set("q_desired", q)
             return
 
         # delta (默认) — 仅修改第 7 关节
@@ -112,7 +112,7 @@ class JointTeleopServer:
         # 限位保护
         q_target[6] = np.clip(q_target[6], JOINT_LIMITS_MIN[6], JOINT_LIMITS_MAX[6])
 
-        await self.controller.set("q_desired", q_target)
+        self.controller.set("q_desired", q_target)
 
     # ─── 获取机器人状态 ─────────────────────────────────────
     def get_robot_state(self) -> dict:

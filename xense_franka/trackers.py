@@ -1,8 +1,7 @@
 """Tracker context managers for structured impedance control sessions.
 
 Each tracker switches the controller to the appropriate mode on entry and
-optionally restores the previous mode and gains on exit.  Trackers support
-both synchronous ``with`` and asynchronous ``async with`` usage.
+optionally restores the previous mode and gains on exit.
 
 Example::
 
@@ -80,14 +79,6 @@ class JointImpedanceTracker:
         self._exit()
         return False
 
-    # Async context manager
-    async def __aenter__(self):
-        return self._enter()
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self._exit()
-        return False
-
     def set_target(self, q, dq=None, tau_ff=None):
         self._ctrl._set_joint_reference(q, dq=dq, tau_ff=tau_ff)
 
@@ -157,14 +148,6 @@ class CartesianImpedanceTracker:
         return self._enter()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._exit()
-        return False
-
-    # Async context manager
-    async def __aenter__(self):
-        return self._enter()
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
         self._exit()
         return False
 
@@ -271,13 +254,6 @@ class ExponentialImpedanceTracker:
         return self._enter()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._exit()
-        return False
-
-    async def __aenter__(self):
-        return self._enter()
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
         self._exit()
         return False
 

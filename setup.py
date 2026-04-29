@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="xense_franka",
-    version="0.3.0",
+    version="0.4.0",
     packages=find_packages(),
 
     install_requires=[
@@ -15,7 +15,7 @@ setup(
     ],
 
     author="dyl",
-    description="Xense Franka asyncio control SDK",
+    description="Xense Franka control SDK",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
 

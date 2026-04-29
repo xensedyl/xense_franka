@@ -1,13 +1,12 @@
 import pygame
 import time
-import asyncio
 import numpy as np
 from xense_franka.robot import RobotInterface
 from xense_franka import FrankaController
 from scipy.spatial.transform import Rotation as R
 
 
-async def main(): 
+def main():
 
     # 先初始化 pygame，避免在控制循环运行中初始化导致通信超时
     pygame.init()
@@ -24,11 +23,11 @@ async def main():
     robot = RobotInterface("192.168.99.111")
     controller = FrankaController(robot)
 
-    await controller.start()
+    controller.start()
 
-    await controller.move([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, 0.7853])
+    controller.move([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, 0.7853])
 
-    await asyncio.sleep(1.0)
+    time.sleep(1.0)
 
     controller.switch("osc")
     controller.ee_kp = np.array([300.0, 300.0, 300.0, 1000.0, 1000.0, 1000.0])
@@ -36,7 +35,7 @@ async def main():
     controller.set_freq(50)  # Set 50Hz update rate
 
     deadzone = 0.1
-    
+
     while True:
         pygame.event.pump()
 
@@ -53,10 +52,10 @@ async def main():
         ry = 0 if abs(ry) < deadzone else ry
 
         # Scale the inputs to get reasonable movements
-        translation_delta = np.clip(np.array([-ly, -lx, -ry]) * 0.003, -0.003, 0.003) 
+        translation_delta = np.clip(np.array([-ly, -lx, -ry]) * 0.003, -0.003, 0.003)
         rotation_delta = np.array([0, 0, -rx]) * 0.5
         rotation_delta = np.clip(rotation_delta, -0.5, 0.5)
-        rotation_delta = R.from_euler('xyz', rotation_delta, degrees=True).as_matrix() 
+        rotation_delta = R.from_euler('xyz', rotation_delta, degrees=True).as_matrix()
 
         # Get current desired end-effector pose
         with controller.state_lock:
@@ -80,12 +79,12 @@ async def main():
         print("Updated EE pose:\n", current_ee)
 
 
-        await controller.set("ee_desired", current_ee)
-        
+        controller.set("ee_desired", current_ee)
+
         # 关键：pygame.event.pump() 是非阻塞的，需要手动控制频率
         # pyspacemouse.read() 会阻塞等待数据，所以02不需要这行
-        # await asyncio.sleep(1/50)  # 50Hz 与 set_freq 匹配
+        # time.sleep(1/50)  # 50Hz 与 set_freq 匹配
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

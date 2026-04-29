@@ -56,10 +56,10 @@ class TeleopServer:
         self.robot = RobotInterface(self.robot_ip)
         self.controller = FrankaController(self.robot)
 
-        await self.controller.start()
+        self.controller.start()
 
         # 移动到初始位姿
-        await self.controller.move(HOME_JOINTS)
+        self.controller.move(HOME_JOINTS)
         await asyncio.sleep(1.0)
 
         if self.control_mode == "cartesian":
@@ -122,17 +122,17 @@ class TeleopServer:
         if cmd_type == "reset":
             if self.control_mode == "cartesian":
                 print("[Server] 重置到初始末端位姿...")
-                await self.controller.set("ee_desired", self.initial_ee.copy())
+                self.controller.set("ee_desired", self.initial_ee.copy())
             else:
                 print("[Server] 重置到初始关节位置...")
-                await self.controller.set("q_desired", self.initial_q.copy())
+                self.controller.set("q_desired", self.initial_q.copy())
             await asyncio.sleep(0.5)
             return
 
         # ── 笛卡尔指令 ──
         if cmd_type == "cartesian_absolute":
             pose = np.array(cmd["pose"], dtype=np.float64).reshape(4, 4)
-            await self.controller.set("ee_desired", pose)
+            self.controller.set("ee_desired", pose)
             return
 
         if cmd_type == "cartesian_delta":
@@ -146,14 +146,14 @@ class TeleopServer:
             current_ee[:3, 3] += translation_delta
             current_ee[:3, :3] = rotation_delta @ current_ee[:3, :3]
 
-            await self.controller.set("ee_desired", current_ee)
+            self.controller.set("ee_desired", current_ee)
             return
 
         # ── 关节指令 ──
         if cmd_type == "joint_absolute":
             q = np.array(cmd["q_desired"], dtype=np.float64)
             q = np.clip(q, JOINT_LIMITS_MIN, JOINT_LIMITS_MAX)
-            await self.controller.set("q_desired", q)
+            self.controller.set("q_desired", q)
             return
 
         if cmd_type == "joint_delta":
@@ -165,7 +165,7 @@ class TeleopServer:
             q_target += joint_deltas
             q_target = np.clip(q_target, JOINT_LIMITS_MIN, JOINT_LIMITS_MAX)
 
-            await self.controller.set("q_desired", q_target)
+            self.controller.set("q_desired", q_target)
             return
 
     # ─── 获取机器人状态 ─────────────────────────────────────

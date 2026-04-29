@@ -5,14 +5,13 @@ desired positions, and control torques. The collected data is saved to a .npz fi
 """
 
 
-import asyncio 
-import numpy as np 
+import numpy as np
 from xense_franka.robot import RobotInterface
 from xense_franka import FrankaController
 
 
-async def main():
-    robot = RobotInterface(None) 
+def main():
+    robot = RobotInterface(None)
     # robot = RobotInterface()
     controller = FrankaController(robot)
 
@@ -26,6 +25,6 @@ async def main():
     print(achieved_torques_real)
     ee = state['ee']
     print(ee)
-        
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
