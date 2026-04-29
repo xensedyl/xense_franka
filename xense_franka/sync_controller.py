@@ -108,7 +108,11 @@ class SyncFrankaController:
             return
 
         self._shutdown()
-        self._started = False
+        # Only mark as stopped if shutdown actually completed.  If
+        # _shutdown() returned early (thread still alive), keep
+        # _started=True to prevent start() from creating a second backend.
+        if self._thread is None:
+            self._started = False
 
     def _shutdown(self):
         """Best-effort teardown of controller, robot, event-loop, and thread.
@@ -144,6 +148,24 @@ class SyncFrankaController:
                 future.cancel()
 
             self._loop.call_soon_threadsafe(self._loop.stop)
+        else:
+            # Event loop is dead or was never started.  Do synchronous
+            # cleanup so the FCI session / control thread don't leak.
+            if self._controller:
+                self._controller._stop_event.set()
+                if self._controller._thread:
+                    self._controller._thread.join(timeout=2.0)
+                    if not self._controller._thread.is_alive():
+                        # Thread exited — safe to release FCI session.
+                        try:
+                            self._robot.stop()
+                        except Exception:
+                            pass
+            elif self._robot:
+                try:
+                    self._robot.stop()
+                except Exception:
+                    pass
 
         if self._thread:
             self._thread.join(timeout=2.0)

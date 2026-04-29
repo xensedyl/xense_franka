@@ -105,6 +105,17 @@ class FrankaController:
 
         self.initialize()
 
+    @property
+    def effective_type(self) -> str:
+        """The controller type that will be active on the next control tick.
+
+        If a transition is pending (posted by ``switch()`` but not yet
+        consumed by the control loop), this returns the *target* type.
+        Otherwise it returns the current ``self.type``.
+        """
+        pending = self._pending_transition
+        return pending if pending is not None else self.type
+
     # ------------------------------------------------------------------
     # Backward-compatible property accessors
     # ------------------------------------------------------------------
@@ -603,20 +614,40 @@ class FrankaController:
         self._thread = threading.Thread(target=self._loop, name="xense-franka-control", daemon=True)
         self._thread.start()
 
-        start_deadline = time.time() + 2.0
-        while time.time() < start_deadline:
-            if self._ready_event.wait(timeout=0.05):
-                self._assert_loop_ok()
-                return self._thread
-            await asyncio.sleep(0)
+        try:
+            start_deadline = time.time() + 2.0
+            while time.time() < start_deadline:
+                if self._ready_event.wait(timeout=0.05):
+                    self._assert_loop_ok()
+                    return self._thread
+                await asyncio.sleep(0)
 
-        self._assert_loop_ok()
-        raise TimeoutError("Timed out waiting for control loop to start")
+            self._assert_loop_ok()
+            raise TimeoutError("Timed out waiting for control loop to start")
+        except BaseException:
+            # Roll back: stop the control thread and release the FCI session.
+            await self.stop()
+            raise
 
     async def stop(self):
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                # Control thread is likely stuck in FCI I/O holding _io_lock.
+                # Calling robot.stop() would deadlock on the same lock, so we
+                # can only warn and let the daemon thread die with the process.
+                import warnings
+                warnings.warn(
+                    "xense_franka: control thread did not exit within "
+                    "timeout — robot.stop() skipped to avoid deadlock",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._thread = None
+                self.running = False
+                await asyncio.sleep(0)
+                return
             self._thread = None
         self.running = False
         self.robot.stop()

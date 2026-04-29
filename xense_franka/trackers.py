@@ -57,7 +57,7 @@ class JointImpedanceTracker:
         self._damping = damping
 
     def _enter(self):
-        self._prev_type = self._ctrl.type
+        self._prev_type = self._ctrl.effective_type
         self._prev_gains = self._ctrl._joint_gains_handle.get().copy()
         self._ctrl.switch("impedance")
         if self._stiffness is not None:
@@ -134,7 +134,7 @@ class CartesianImpedanceTracker:
         self._nullspace_stiffness = nullspace_stiffness
 
     def _enter(self):
-        self._prev_type = self._ctrl.type
+        self._prev_type = self._ctrl.effective_type
         self._prev_gains = self._ctrl._cart_gains_handle.get().copy()
         self._ctrl.switch("osc")
         if self._stiffness is not None:
@@ -232,7 +232,7 @@ class ExponentialImpedanceTracker:
         self._goal_pose: Optional[np.ndarray] = None
 
     def _enter(self):
-        self._prev_type = self._ctrl.type
+        self._prev_type = self._ctrl.effective_type
         # Save gains for the mode we are about to use
         if self._mode == "impedance":
             self._prev_joint_gains = self._ctrl._joint_gains_handle.get().copy()
