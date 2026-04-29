@@ -12,22 +12,65 @@ Main Components:
 Quick Example:
     >>> import asyncio
     >>> from xense_franka import RobotInterface, FrankaController
-    >>> 
+    >>>
     >>> async def main():
     ...     robot = RobotInterface("172.16.0.2")
     ...     controller = FrankaController(robot)
     ...     await controller.start()
     ...     await controller.move()  # Move to home
     ...     await controller.stop()
-    >>> 
+    >>>
     >>> asyncio.run(main())
 
 For detailed documentation, see README.md and USAGE_GUIDE.md
 """
 
+from xense_franka.constants import FR3_JOINT_LIMITS_LOWER, FR3_JOINT_LIMITS_UPPER, FR3_TORQUE_LIMIT
 from xense_franka.controller import FrankaController
+from xense_franka.handles import (
+    CartesianGainsHandle,
+    CartesianReferenceHandle,
+    Handle,
+    JointGainsHandle,
+    JointReferenceHandle,
+)
+from xense_franka.references import (
+    CartesianImpedanceGains,
+    CartesianReference,
+    JointImpedanceGains,
+    JointReference,
+)
 from xense_franka.robot import RobotInterface
 from xense_franka.sync_controller import SyncFrankaController
+from xense_franka.trackers import (
+    CartesianImpedanceTracker,
+    ExponentialImpedanceTracker,
+    JointImpedanceTracker,
+)
 
-__version__ = "0.2.0"
-__all__ = ["RobotInterface", "FrankaController", "SyncFrankaController"]
+__version__ = "0.3.0"
+__all__ = [
+    # Core
+    "RobotInterface",
+    "FrankaController",
+    "SyncFrankaController",
+    # Constants
+    "FR3_JOINT_LIMITS_LOWER",
+    "FR3_JOINT_LIMITS_UPPER",
+    "FR3_TORQUE_LIMIT",
+    # References / Gains
+    "JointReference",
+    "CartesianReference",
+    "JointImpedanceGains",
+    "CartesianImpedanceGains",
+    # Handles
+    "Handle",
+    "JointReferenceHandle",
+    "CartesianReferenceHandle",
+    "JointGainsHandle",
+    "CartesianGainsHandle",
+    # Trackers
+    "JointImpedanceTracker",
+    "CartesianImpedanceTracker",
+    "ExponentialImpedanceTracker",
+]

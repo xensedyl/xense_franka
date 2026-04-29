@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation as R
 
 from .robot import RobotInterface
 from .controller import FrankaController
+from .trackers import JointImpedanceTracker, CartesianImpedanceTracker, ExponentialImpedanceTracker
 
 
 class SyncFrankaController:
@@ -234,6 +235,34 @@ class SyncFrankaController:
     def initial_qpos(self) -> np.ndarray:
         """获取初始关节位置"""
         return self._controller.initial_qpos.copy()
+
+    def joint_tracker(self, stiffness=None, damping=None, damping_ratio: float = 1.0, restore_on_exit: bool = True) -> JointImpedanceTracker:
+        """Create a JointImpedanceTracker bound to this controller."""
+        return JointImpedanceTracker(
+            self._controller, stiffness=stiffness, damping=damping,
+            damping_ratio=damping_ratio, restore_on_exit=restore_on_exit,
+        )
+
+    def cartesian_tracker(self, stiffness=None, damping=None, damping_ratio: float = 1.0,
+                          nullspace_stiffness: Optional[float] = None,
+                          restore_on_exit: bool = True) -> CartesianImpedanceTracker:
+        """Create a CartesianImpedanceTracker bound to this controller."""
+        return CartesianImpedanceTracker(
+            self._controller, stiffness=stiffness, damping=damping,
+            damping_ratio=damping_ratio, nullspace_stiffness=nullspace_stiffness,
+            restore_on_exit=restore_on_exit,
+        )
+
+    def exponential_tracker(self, mode: str = "impedance", time_constant: float = 0.5,
+                            stiffness=None, damping=None, damping_ratio: float = 1.0,
+                            nullspace_stiffness: Optional[float] = None,
+                            restore_on_exit: bool = True) -> ExponentialImpedanceTracker:
+        """Create an ExponentialImpedanceTracker bound to this controller."""
+        return ExponentialImpedanceTracker(
+            self._controller, mode=mode, time_constant=time_constant,
+            stiffness=stiffness, damping=damping, damping_ratio=damping_ratio,
+            nullspace_stiffness=nullspace_stiffness, restore_on_exit=restore_on_exit,
+        )
 
     def __enter__(self):
         """支持 with 语句"""
