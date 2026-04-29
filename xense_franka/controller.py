@@ -1,724 +1,675 @@
-import numpy as np
-from scipy.spatial.transform import Rotation as R
-from copy import deepcopy
-import sys 
-sys.path.append(".")
-import threading
 import asyncio
+import threading
 import time
-from tqdm import trange
+from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
-import numpy as np 
-import time 
+from typing import Optional
+
+import numpy as np
+from ruckig import InputParameter, Result, Ruckig, Trajectory
+from scipy.spatial.transform import Rotation as R
+
 from xense_franka.robot import RobotInterface
-from ruckig import InputParameter, Ruckig, Trajectory, Result
 
 CUR_DIR = Path(__file__).parent.resolve()
 
 
+FR3_JOINT_LIMITS_LOWER = np.array(
+    [-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159], dtype=float
+)
+FR3_JOINT_LIMITS_UPPER = np.array(
+    [2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159], dtype=float
+)
+FR3_TORQUE_LIMIT = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0], dtype=float)
 
-class FrankaController: 
+
+def _as_array(value, size: int) -> np.ndarray:
+    arr = np.asarray(value, dtype=float)
+    if arr.shape == ():
+        arr = np.full(size, float(arr), dtype=float)
+    if arr.shape != (size,):
+        raise ValueError(f"Expected shape ({size},), got {arr.shape}")
+    return arr.copy()
+
+
+def _normalize_quat(quat: np.ndarray) -> np.ndarray:
+    quat = np.asarray(quat, dtype=float).copy()
+    norm = np.linalg.norm(quat)
+    if norm < 1e-12:
+        raise ValueError("Quaternion norm is too small")
+    return quat / norm
+
+
+def _orthonormalize_rotation(matrix: np.ndarray) -> np.ndarray:
+    return R.from_matrix(np.asarray(matrix, dtype=float)).as_matrix()
+
+
+def _pose_copy(pose: np.ndarray) -> np.ndarray:
+    pose = np.asarray(pose, dtype=float)
+    if pose.shape != (4, 4):
+        raise ValueError(f"Expected pose shape (4, 4), got {pose.shape}")
+    out = pose.copy()
+    out[:3, :3] = _orthonormalize_rotation(out[:3, :3])
+    return out
+
+
+def _critical_damping(stiffness: np.ndarray) -> np.ndarray:
+    return 2.0 * np.sqrt(np.maximum(stiffness, 0.0))
+
+
+def _saturate_torque_rate(tau_desired: np.ndarray, tau_reference: np.ndarray, max_delta_tau: np.ndarray) -> np.ndarray:
+    return tau_reference + np.clip(tau_desired - tau_reference, -max_delta_tau, max_delta_tau)
+
+
+def _compute_joint_limit_torque(
+    q: np.ndarray,
+    dq: np.ndarray,
+    lower_limits: np.ndarray,
+    upper_limits: np.ndarray,
+    activation_distance: float,
+    stiffness: float,
+    damping: float,
+    max_torque: float,
+) -> np.ndarray:
+    tau_limit = np.zeros(7, dtype=float)
+    activation_distance = max(float(activation_distance), 1e-6)
+
+    for i in range(7):
+        lower_soft = lower_limits[i] + activation_distance
+        upper_soft = upper_limits[i] - activation_distance
+
+        if q[i] < lower_soft:
+            penetration = (lower_soft - q[i]) / activation_distance
+            tau = stiffness * (np.exp(penetration) - 1.0)
+            if dq[i] < 0.0:
+                tau += damping * (-dq[i])
+            tau_limit[i] = min(tau, max_torque)
+        elif q[i] > upper_soft:
+            penetration = (q[i] - upper_soft) / activation_distance
+            tau = -stiffness * (np.exp(penetration) - 1.0)
+            if dq[i] > 0.0:
+                tau -= damping * dq[i]
+            tau_limit[i] = max(tau, -max_torque)
+
+    return tau_limit
+
+
+def _pseudo_inverse(matrix: np.ndarray, tolerance: float = 1e-6) -> np.ndarray:
+    u, s, vh = np.linalg.svd(matrix, full_matrices=False)
+    s_inv = np.zeros_like(s)
+    mask = s > tolerance
+    s_inv[mask] = 1.0 / s[mask]
+    return vh.T @ np.diag(s_inv) @ u.T
+
+
+@dataclass
+class JointReference:
+    q: np.ndarray = field(default_factory=lambda: np.zeros(7, dtype=float))
+    dq: np.ndarray = field(default_factory=lambda: np.zeros(7, dtype=float))
+    tau_ff: np.ndarray = field(default_factory=lambda: np.zeros(7, dtype=float))
+
+    def copy(self) -> "JointReference":
+        return JointReference(self.q.copy(), self.dq.copy(), self.tau_ff.copy())
+
+
+@dataclass
+class CartesianReference:
+    pose: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=float))
+    twist: np.ndarray = field(default_factory=lambda: np.zeros(6, dtype=float))
+    nullspace_target: Optional[np.ndarray] = None
+
+    def copy(self) -> "CartesianReference":
+        return CartesianReference(
+            pose=self.pose.copy(),
+            twist=self.twist.copy(),
+            nullspace_target=None if self.nullspace_target is None else self.nullspace_target.copy(),
+        )
+
+
+@dataclass
+class JointImpedanceGains:
+    stiffness: np.ndarray = field(default_factory=lambda: np.ones(7, dtype=float) * 80.0)
+    damping: np.ndarray = field(default_factory=lambda: np.ones(7, dtype=float) * 4.0)
+
+    def copy(self) -> "JointImpedanceGains":
+        return JointImpedanceGains(self.stiffness.copy(), self.damping.copy())
+
+
+@dataclass
+class CartesianImpedanceGains:
+    stiffness: np.ndarray = field(default_factory=lambda: np.ones(6, dtype=float) * 100.0)
+    damping: np.ndarray = field(default_factory=lambda: np.ones(6, dtype=float) * 4.0)
+    nullspace_stiffness: float = 0.0
+
+    def copy(self) -> "CartesianImpedanceGains":
+        return CartesianImpedanceGains(
+            self.stiffness.copy(),
+            self.damping.copy(),
+            float(self.nullspace_stiffness),
+        )
+
+
+class FrankaController:
     """
-    High-level asyncio controller for Franka robots with multiple control modes.
-    
-    This controller runs a 1kHz torque control loop in the background using asyncio,
-    while allowing you to send high-level commands asynchronously. Supports three
-    control modes:
-    
-    1. Impedance Control: Joint-space spring-damper control
-    2. Operational Space Control (OSC): Task-space control with null-space
-    3. Direct Torque Control: Raw torque commands
-    
-    The controller automatically handles:
-    - Background control loop at 1kHz
-    - Torque rate limiting for safety
-    - Thread-safe state updates
-    - Rate-limited command updates
-    - Smooth trajectory generation
-    
-    Attributes:
-        robot (RobotInterface): Robot interface instance
-        type (str): Current controller type ("impedance", "osc", "torque")
-        running (bool): Whether control loop is active
-        state (dict): Current robot state (updated at 1kHz)
-        
-        # Impedance control gains
-        kp (np.ndarray): Joint position stiffness [Nm/rad] (7,)
-        kd (np.ndarray): Joint damping [Nm⋅s/rad] (7,)
-        
-        # OSC gains
-        ee_kp (np.ndarray): EE stiffness [N/m for xyz, Nm/rad for rpy] (6,)
-        ee_kd (np.ndarray): EE damping [N⋅s/m for xyz, Nm⋅s/rad for rpy] (6,)
-        null_kp (np.ndarray): Null-space stiffness [Nm/rad] (7,)
-        null_kd (np.ndarray): Null-space damping [Nm⋅s/rad] (7,)
-        
-        # Target states
-        q_desired (np.ndarray): Desired joint positions [rad] (7,)
-        ee_desired (np.ndarray): Desired EE pose as 4x4 transform
-        torque (np.ndarray): Direct torque command [Nm] (7,)
-        
-        # Safety
-        clip (bool): Enable torque rate limiting (default: True)
-        torque_diff_limit (float): Max torque rate [Nm/s] (default: 990)
-        
-    Examples:
-        Basic usage:
-            >>> robot = RobotInterface("172.16.0.2")
-            >>> controller = FrankaController(robot)
-            >>> await controller.start()
-            >>> controller.switch("impedance")
-            >>> controller.set_freq(50)
-            >>> await controller.set("q_desired", target_joints)
-            >>> await controller.stop()
-        
-        OSC control:
-            >>> controller.switch("osc")
-            >>> controller.ee_kp = np.array([300, 300, 300, 1000, 1000, 1000])
-            >>> controller.set_freq(50)
-            >>> desired_ee = np.eye(4)
-            >>> desired_ee[:3, 3] = [0.4, 0.0, 0.5]
-            >>> await controller.set("ee_desired", desired_ee)
-        
-        Direct torque:
-            >>> controller.switch("torque")
-            >>> controller.torque = np.zeros(7)  # Zero torques
-        
-    Caveats:
-        - Must await controller.start() before sending commands
-        - Use set_freq() before set() to enforce timing
-        - High gains can cause instability or safety triggers
-        - Switching controllers resets initial state
-        - State access is thread-safe but copy if modifying
-        - Control loop must run continuously at ~1kHz
+    High-level Franka controller with an async command API and a dedicated
+    background real-time thread for torque control.
+
+    The async methods only publish new references or wait for motion timing.
+    The 1kHz control loop runs in a dedicated Python thread and keeps one
+    impedance controller alive, similar to franky's tracking motions.
     """
 
     def __init__(self, robot: RobotInterface):
-        """
-        Initialize controller with robot interface.
-        
-        Args:
-            robot (RobotInterface): Initialized robot interface
-            
-        Note:
-            Controller is initialized in "impedance" mode with conservative gains.
-            Call start() to begin the control loop, then switch() to change modes.
-            
-        Default Gains:
-            - Impedance: kp=80, kd=4 (per joint)
-            - OSC: ee_kp=[100]*6, ee_kd=[4]*6
-            - Null-space: null_kp=1, null_kd=1
-        """
         self.robot = robot
 
-        self.initialize() 
         self.state_lock = threading.Lock()
+        self._control_lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._loop_exception: Optional[BaseException] = None
 
         self.type = "impedance"
         self.running = False
-        self.task = None
-        self.clip = True 
-
-
-        self.kp, self.kd = np.ones(7) * 80, np.ones(7) * 4
-        self.ki = np.ones(7) * 0.1  # Integral gains
-        self.error_integral = np.zeros(7)  # Accumulated error
-        self.ee_kp, self.ee_kd = np.ones(6) * 100, np.ones(6) * 4
-        self.null_kp, self.null_kd = np.ones(7) * 1, np.ones(7) * 1
-
-
-        self.track = False 
-        self.torque_diff_limit = 990.
-        self.torque_limit = np.array([87, 87, 87, 87, 12, 12, 12])  # Nm
-        
-        # Rate limiting for .set() method
-        self._update_freq = 50.0  # Default 50Hz
-        self._last_update_time = {}
-        self._pending_updates = {}
-
-        self.state = None 
-
+        self.clip = True
+        self.track = False
         self.verbose = False
 
+        self.compensate_coriolis = True
+        self.joint_limit_repulsion_active = True
+        self.max_delta_tau = np.ones(7, dtype=float)
+        self.torque_limit = FR3_TORQUE_LIMIT.copy()
+        self.joint_limit_activation_distance = 0.1
+        self.joint_limit_stiffness = 4.0
+        self.joint_limit_damping = 1.0
+        self.joint_limit_max_torque = 5.0
+        self.lower_joint_limits = FR3_JOINT_LIMITS_LOWER.copy()
+        self.upper_joint_limits = FR3_JOINT_LIMITS_UPPER.copy()
+        self.cartesian_position_clip = np.array([0.10, 0.10, 0.10], dtype=float)
+        self.cartesian_rotation_clip = np.array([0.25, 0.25, 0.25], dtype=float)
+        self.gains_time_constant = 0.1
+        self.torque = np.zeros(7, dtype=float)
+        self.error_integral = np.zeros(7, dtype=float)
+        self.integral_limit = 10.0
 
-    async def test_connection(self): 
-        """
-        Test control loop timing and diagnose connection quality.
-        
-        Runs for 5 seconds and prints statistics about control loop performance:
-        - Actual frequency (should be ~1000 Hz)
-        - Mean/std/min/max loop time
-        - Jitter (max - min)
-        
-        Use this to verify your setup is working correctly before running experiments.
-        
-        Example Output:
-            Control loop stats (last 1000 iterations):
-              Frequency: 1000.2 Hz (target: 1000 Hz)
-              Mean dt: 1.000 ms, Std: 0.015 ms
-              Min dt: 0.985 ms, Max dt: 1.025 ms
-              Jitter (max-min): 0.040 ms
-              
-        Caveats:
-            - High jitter (>0.5ms) indicates system load or network issues
-            - Frequency <990 Hz suggests performance problems
-            - Run on a dedicated realtime system for best results
-        """
+        self._publish_freq = 50.0
+        self._publish_dt = 1.0 / self._publish_freq
+        self._publish_next_deadline = {}
 
-        self.track = True 
-        await asyncio.sleep(5)
+        self.state = None
+
+        self._joint_reference = JointReference()
+        self._cartesian_reference = CartesianReference()
+
+        self.joint_gains = JointImpedanceGains()
+        self._joint_gain_target = self.joint_gains.copy()
+        self.cartesian_gains = CartesianImpedanceGains()
+        self._cartesian_gain_target = self.cartesian_gains.copy()
+
+        self.initialize()
+        self._sync_public_aliases()
+
+    def _sync_public_aliases(self):
+        self.kp = self.joint_gains.stiffness.copy()
+        self.kd = self.joint_gains.damping.copy()
+        self.ee_kp = self.cartesian_gains.stiffness.copy()
+        self.ee_kd = self.cartesian_gains.damping.copy()
+        null_damping = _critical_damping(np.array([self.cartesian_gains.nullspace_stiffness], dtype=float))[0]
+        self.null_kp = np.ones(7, dtype=float) * self.cartesian_gains.nullspace_stiffness
+        self.null_kd = np.ones(7, dtype=float) * null_damping
+        self.q_desired = self._joint_reference.q.copy()
+        self.ee_desired = self._cartesian_reference.pose.copy()
+
+    def initialize(self):
+        initial_state = self.robot.state
+        self.initial_ee = initial_state["ee"].copy()
+        self.initial_qpos = initial_state["qpos"].copy()
+        self.initial_qvel = initial_state["qvel"].copy()
+        self.last_torque = initial_state["last_torque"].copy()
+        self.state = initial_state
+
+        self._joint_reference = JointReference(
+            q=self.initial_qpos.copy(),
+            dq=np.zeros(7, dtype=float),
+            tau_ff=np.zeros(7, dtype=float),
+        )
+        self._cartesian_reference = CartesianReference(
+            pose=self.initial_ee.copy(),
+            twist=np.zeros(6, dtype=float),
+            nullspace_target=self.initial_qpos.copy(),
+        )
+
+    async def test_connection(self):
+        self.track = True
+        await asyncio.sleep(5.0)
         self.track = False
 
-    def initialize(self): 
-
-        # Get initial state
-        initial_state = self.robot.state
-        self.initial_ee = initial_state['ee']
-        self.initial_qpos = deepcopy(initial_state['qpos'])
-        self.initial_qvel = deepcopy(initial_state['qvel'])
-        self.last_torque = initial_state['last_torque']
-
-        self.q_desired= self.initial_qpos
-        self.ee_desired = self.initial_ee
-
-    def _update_desired(self, desired):
-        """
-        Update the desired joint positions, kp and kd
-        This function is called by the server when a client sends new values
-        Thread-safe update of shared state.
-        
-        Args:
-            desired: Desired joint positions (7-element array)
-            kp: Joint position stiffness gains (7-element array)
-            kd: Joint velocity damping gains (7-element array)
-        """
-        with self.state_lock:
-            self.q_desired = np.array(desired) if type(desired) == list else desired
-    
     def set_freq(self, freq: float):
-        """
-        Set the update frequency for rate-limited set() calls.
-        
-        This enforces strict timing for subsequent set() calls, automatically
-        sleeping to maintain the specified frequency. Prevents sending commands
-        too fast and ensures smooth, consistent control.
-        
-        Args:
-            freq (float): Desired update frequency in Hz (typically 10-100 Hz)
-            
-        Note:
-            Must be called BEFORE the first set() call to take effect.
-            Each attribute tracked by set() has independent timing.
-            
-        Examples:
-            >>> controller.set_freq(50)  # 50 Hz updates
-            >>> for i in range(100):
-            ...     await controller.set("q_desired", compute_target())
-            ...     # Automatically sleeps to maintain 50 Hz
-            
-        Caveats:
-            - Don't set freq > 200 Hz (unnecessary and may cause timing issues)
-            - Lower freq = smoother motion but slower response
-            - Higher freq = faster response but requires more computation
-            - Timing is per-attribute (q_desired and ee_desired tracked separately)
-        """
-        self._update_freq = freq
-    
-    async def set(self, attr: str, value):
-        """
-        Rate-limited setter that enforces strict timing for control updates.
-        
-        This method ensures updates to controller attributes happen at the
-        frequency specified by set_freq(). It compensates for drift by tracking
-        the target time for each update, guaranteeing consistent timing even
-        if your computation time varies.
-        
-        Args:
-            attr (str): Attribute name to set. Common values:
-                       - "q_desired": Joint position target (impedance mode)
-                       - "ee_desired": End-effector pose target (OSC mode)
-                       - "torque": Direct torque command (torque mode)
-            value: Value to set. Type depends on attr:
-                  - q_desired: np.ndarray (7,) [rad]
-                  - ee_desired: np.ndarray (4, 4) homogeneous transform
-                  - torque: np.ndarray (7,) [Nm]
-                  
-        Note:
-            - Automatically sleeps to maintain frequency set by set_freq()
-            - First call for an attribute initializes timing
-            - Each attribute has independent timing tracking
-            - Thread-safe update of shared state
-            
-        Examples:
-            Impedance control:
-                >>> controller.set_freq(50)
-                >>> for i in range(100):
-                ...     target = initial_q + np.sin(i / 50.0 * np.pi) * 0.1
-                ...     await controller.set("q_desired", target)
-            
-            OSC control:
-                >>> controller.set_freq(100)
-                >>> desired_ee = np.eye(4)
-                >>> desired_ee[:3, 3] = [0.5, 0.0, 0.3]
-                >>> await controller.set("ee_desired", desired_ee)
-            
-        Caveats:
-            - Must call set_freq() before first set() call
-            - If computation takes longer than 1/freq, timing will slip
-            - Don't mix set() and direct attribute assignment
-            - Don't call set() faster than the specified frequency
-        """
-        current_time = time.perf_counter()
-        dt = 1.0 / self._update_freq
-        
-        # Initialize tracking for this attribute if first time
-        if attr not in self._last_update_time:
-            self._last_update_time[attr] = current_time
-            # Sleep for the first update too to maintain consistent timing
-            await asyncio.sleep(dt)
-            with self.state_lock:
-                setattr(self, attr, value)
-            self._last_update_time[attr] = current_time + dt
+        if freq <= 0:
+            raise ValueError("freq must be positive")
+        self._publish_freq = float(freq)
+        self._publish_dt = 1.0 / self._publish_freq
+        self._publish_next_deadline.clear()
+
+    async def _rate_limit_publish(self, key: str, dt: Optional[float] = None):
+        now = time.perf_counter()
+        dt = self._publish_dt if dt is None else float(dt)
+        deadline = self._publish_next_deadline.get(key)
+        if deadline is None:
+            self._publish_next_deadline[key] = now + dt
             return
-        
-        # Calculate target time for this update
-        target_time = self._last_update_time[attr] + dt
-        
-        # Sleep until target time
-        sleep_time = target_time - current_time
-        if sleep_time > 0:
-            await asyncio.sleep(sleep_time)
-        
+        if deadline > now:
+            await asyncio.sleep(deadline - now)
+            now = time.perf_counter()
+        next_deadline = max(deadline + dt, now)
+        self._publish_next_deadline[key] = next_deadline
+
+    def _assert_loop_ok(self):
+        if self._loop_exception is not None:
+            raise RuntimeError("Control loop terminated unexpectedly") from self._loop_exception
+
+    def _exp_smooth(self, current: np.ndarray, target: np.ndarray, dt: float) -> np.ndarray:
+        if self.gains_time_constant <= 0.0:
+            return target.copy()
+        alpha = 1.0 - np.exp(-dt / self.gains_time_constant)
+        return current + alpha * (target - current)
+
+    def _compute_nullspace_torque(self, jacobian: np.ndarray, q: np.ndarray, dq: np.ndarray, target: np.ndarray) -> np.ndarray:
+        stiffness = max(self.cartesian_gains.nullspace_stiffness, 0.0)
+        if stiffness <= 0.0 or target is None:
+            return np.zeros(7, dtype=float)
+        damping = 2.0 * np.sqrt(stiffness)
+        jacobian_transpose_pinv = _pseudo_inverse(jacobian.T)
+        nullspace_projector = np.eye(7) - jacobian.T @ jacobian_transpose_pinv
+        return nullspace_projector @ (stiffness * (target - q) - damping * dq)
+
+    def _compute_joint_limit_torque(self, q: np.ndarray, dq: np.ndarray) -> np.ndarray:
+        if not self.joint_limit_repulsion_active:
+            return np.zeros(7, dtype=float)
+        return _compute_joint_limit_torque(
+            q=q,
+            dq=dq,
+            lower_limits=self.lower_joint_limits,
+            upper_limits=self.upper_joint_limits,
+            activation_distance=self.joint_limit_activation_distance,
+            stiffness=self.joint_limit_stiffness,
+            damping=self.joint_limit_damping,
+            max_torque=self.joint_limit_max_torque,
+        )
+
+    def _refresh_gain_targets_from_aliases(self):
+        self._joint_gain_target = JointImpedanceGains(
+            stiffness=_as_array(self.kp, 7),
+            damping=_as_array(self.kd, 7),
+        )
+        self._cartesian_gain_target = CartesianImpedanceGains(
+            stiffness=_as_array(self.ee_kp, 6),
+            damping=_as_array(self.ee_kd, 6),
+            nullspace_stiffness=float(np.mean(_as_array(self.null_kp, 7))),
+        )
+
+    def set_joint_gains(self, stiffness, damping: Optional[np.ndarray] = None, damping_ratio: float = 1.0):
+        stiffness = _as_array(stiffness, 7)
+        if damping is None:
+            damping = _critical_damping(stiffness) * float(damping_ratio)
+        else:
+            damping = _as_array(damping, 7)
         with self.state_lock:
-            setattr(self, attr, value)
-        
-        # Update last update time to target (not actual) to avoid drift
-        self._last_update_time[attr] = target_time
+            self._joint_gain_target = JointImpedanceGains(stiffness=stiffness, damping=damping)
+            self.kp = stiffness.copy()
+            self.kd = damping.copy()
 
+    def set_cartesian_gains(
+        self,
+        stiffness,
+        damping: Optional[np.ndarray] = None,
+        damping_ratio: float = 1.0,
+        nullspace_stiffness: Optional[float] = None,
+    ):
+        stiffness = _as_array(stiffness, 6)
+        if damping is None:
+            damping = _critical_damping(stiffness) * float(damping_ratio)
+        else:
+            damping = _as_array(damping, 6)
+        if nullspace_stiffness is None:
+            nullspace_stiffness = self._cartesian_gain_target.nullspace_stiffness
+        with self.state_lock:
+            self._cartesian_gain_target = CartesianImpedanceGains(
+                stiffness=stiffness,
+                damping=damping,
+                nullspace_stiffness=float(nullspace_stiffness),
+            )
+            self.ee_kp = stiffness.copy()
+            self.ee_kd = damping.copy()
+            self.null_kp = np.ones(7, dtype=float) * float(nullspace_stiffness)
+            self.null_kd = np.ones(7, dtype=float) * 2.0 * np.sqrt(max(float(nullspace_stiffness), 0.0))
 
-    async def _run(self): 
-        """Run the control loop continuously in the background"""
-        self.running = True
-        
+    def _set_joint_reference(self, q, dq=None, tau_ff=None):
+        q = _as_array(q, 7)
+        if dq is None:
+            dq = np.zeros(7, dtype=float)
+        else:
+            dq = _as_array(dq, 7)
+        if tau_ff is None:
+            tau_ff = np.zeros(7, dtype=float)
+        else:
+            tau_ff = _as_array(tau_ff, 7)
+        with self.state_lock:
+            self._joint_reference = JointReference(q=q, dq=dq, tau_ff=tau_ff)
+            self.q_desired = q.copy()
+
+    def _set_cartesian_reference(self, pose, twist=None, nullspace_target=None):
+        pose = _pose_copy(pose)
+        if twist is None:
+            twist = np.zeros(6, dtype=float)
+        else:
+            twist = _as_array(twist, 6)
+        if nullspace_target is not None:
+            nullspace_target = _as_array(nullspace_target, 7)
+        with self.state_lock:
+            if nullspace_target is None and self._cartesian_reference.nullspace_target is not None:
+                nullspace_target = self._cartesian_reference.nullspace_target.copy()
+            self._cartesian_reference = CartesianReference(
+                pose=pose,
+                twist=twist,
+                nullspace_target=nullspace_target,
+            )
+            self.ee_desired = pose.copy()
+
+    async def set(self, attr: str, value):
+        self._assert_loop_ok()
+        await self._rate_limit_publish(attr)
+
+        if attr == "q_desired":
+            self._set_joint_reference(value)
+            return
+        if attr == "ee_desired":
+            self._set_cartesian_reference(value)
+            return
+        if attr == "torque":
+            value = _as_array(value, 7)
+            with self.state_lock:
+                self.torque = value.copy()
+            return
+        setattr(self, attr, value)
+
+    async def set_joint_reference(self, q, dq=None, tau_ff=None):
+        self._assert_loop_ok()
+        await self._rate_limit_publish("joint_reference")
+        self._set_joint_reference(q=q, dq=dq, tau_ff=tau_ff)
+
+    async def set_cartesian_reference(self, pose, twist=None, nullspace_target=None):
+        self._assert_loop_ok()
+        await self._rate_limit_publish("cartesian_reference")
+        self._set_cartesian_reference(pose=pose, twist=twist, nullspace_target=nullspace_target)
+
+    def _loop(self):
         loop_times = []
         last_time = time.perf_counter()
-        log_interval = 1000  # Log every 1000 iterations (1 second at 1000Hz)
         iteration = 0
-        
-        try:
-            while self.running: 
 
-                
-                t0 = time.time() 
-                self.step()
-                
-                # Track timing
+        try:
+            while not self._stop_event.is_set():
+                state = self.robot.read_control_state()
+
+                with self.state_lock:
+                    self.state = state
+                    self.last_torque = state["last_torque"].copy()
+                    self._refresh_gain_targets_from_aliases()
+                    dt = max(float(state.get("dt", 1e-3)), 1e-6)
+                    self.joint_gains.stiffness = self._exp_smooth(
+                        self.joint_gains.stiffness, self._joint_gain_target.stiffness, dt
+                    )
+                    self.joint_gains.damping = self._exp_smooth(
+                        self.joint_gains.damping, self._joint_gain_target.damping, dt
+                    )
+                    self.cartesian_gains.stiffness = self._exp_smooth(
+                        self.cartesian_gains.stiffness, self._cartesian_gain_target.stiffness, dt
+                    )
+                    self.cartesian_gains.damping = self._exp_smooth(
+                        self.cartesian_gains.damping, self._cartesian_gain_target.damping, dt
+                    )
+                    if self.gains_time_constant <= 0.0:
+                        self.cartesian_gains.nullspace_stiffness = self._cartesian_gain_target.nullspace_stiffness
+                    else:
+                        alpha = 1.0 - np.exp(-dt / self.gains_time_constant)
+                        self.cartesian_gains.nullspace_stiffness += (
+                            alpha * (self._cartesian_gain_target.nullspace_stiffness - self.cartesian_gains.nullspace_stiffness)
+                        )
+                    controller_type = self.type
+                    joint_ref = self._joint_reference.copy()
+                    cart_ref = self._cartesian_reference.copy()
+                    direct_torque = self.torque.copy()
+
+                tau_command = self._compute_command(
+                    controller_type=controller_type,
+                    state=state,
+                    joint_ref=joint_ref,
+                    cart_ref=cart_ref,
+                    direct_torque=direct_torque,
+                )
+                self.robot.step(tau_command)
+
+                if not self._ready_event.is_set():
+                    self._ready_event.set()
+
                 if self.track:
                     current_time = time.perf_counter()
-                    dt = current_time - last_time
-                    loop_times.append(dt)
+                    loop_times.append(current_time - last_time)
                     last_time = current_time
                     iteration += 1
-                    
-                    # Log statistics every log_interval iterations
-                    if iteration % log_interval == 0:
-                        loop_times_array = np.array(loop_times)
-                        mean_dt = np.mean(loop_times_array) * 1000  # Convert to ms
-                        std_dt = np.std(loop_times_array) * 1000
-                        min_dt = np.min(loop_times_array) * 1000
-                        max_dt = np.max(loop_times_array) * 1000
+                    if iteration % 1000 == 0 and loop_times:
+                        loop_times_array = np.asarray(loop_times)
+                        mean_dt = np.mean(loop_times_array) * 1000.0
+                        std_dt = np.std(loop_times_array) * 1000.0
+                        min_dt = np.min(loop_times_array) * 1000.0
+                        max_dt = np.max(loop_times_array) * 1000.0
                         actual_freq = 1.0 / np.mean(loop_times_array)
-                        
-                        print(f"Control loop stats (last {log_interval} iterations):")
+                        print(f"Control loop stats (last {len(loop_times)} iterations):")
                         print(f"  Frequency: {actual_freq:.1f} Hz (target: 1000 Hz)")
                         print(f"  Mean dt: {mean_dt:.3f} ms, Std: {std_dt:.3f} ms")
                         print(f"  Min dt: {min_dt:.3f} ms, Max dt: {max_dt:.3f} ms")
                         print(f"  Jitter (max-min): {max_dt - min_dt:.3f} ms")
-                        
                         loop_times.clear()
-
-                dt = time.time() - t0
-                await asyncio.sleep(0)  # Yield control to event loop
-        except Exception as e:
+        except BaseException as exc:
+            self._loop_exception = exc
+        finally:
             self.running = False
-            print(f"Error in control loop: {e}")
-            # diff = (self.torque - self.last_torque)/1e-3
-            # diff = np.abs(diff)
+            self._stop_event.set()
+            self._ready_event.set()
 
-            # if np.any(diff > 1000.):
-            #     # print what axis is causing the issue
-            #     arg_idxs = np.where(diff > 1000.)[0]
-            #     print(f"High torque rate of change detected on axes: {arg_idxs}")
-            #     print((self.torque - self.last_torque)/1e-3) 
-            sys.exit(1)  # Kill the entire script
-    
+    def _compute_command(
+        self,
+        controller_type: str,
+        state: dict,
+        joint_ref: JointReference,
+        cart_ref: CartesianReference,
+        direct_torque: np.ndarray,
+    ) -> np.ndarray:
+        if controller_type == "torque":
+            tau_d = direct_torque
+        elif controller_type == "pid":
+            tau_d = self._pid_step(state, joint_ref)
+        elif controller_type == "osc":
+            tau_d = self._osc_step(state, cart_ref)
+        else:
+            tau_d = self._impedance_step(state, joint_ref)
+
+        if self.clip:
+            tau_d = _saturate_torque_rate(tau_d, state["last_torque"], self.max_delta_tau)
+        tau_d = np.clip(tau_d, -self.torque_limit, self.torque_limit)
+        self.torque = tau_d.copy()
+        return tau_d
+
     async def start(self):
-        """
-        Start the 1kHz background control loop.
-        
-        This creates an asyncio task that runs the control loop continuously
-        at ~1000 Hz. The loop reads robot state, computes control torques based
-        on the current controller type, and sends torque commands.
-        
-        Returns:
-            asyncio.Task: The background control loop task
-            
-        Note:
-            - Blocks for 1 second to ensure loop starts successfully
-            - Starts robot torque control mode automatically
-            - Control loop runs until stop() is called
-            - You can send commands via set() while loop is running
-            
-        Example:
-            >>> await controller.start()
-            >>> # Control loop now running in background
-            >>> controller.set_freq(50)
-            >>> await controller.set("q_desired", target)
-            >>> await controller.stop()
-            
-        Caveats:
-            - Must be awaited (async function)
-            - Don't call start() multiple times without stop()
-            - If loop crashes, robot will trigger safety stop
-            - Check terminal for error messages if robot stops unexpectedly
-        """
+        self._assert_loop_ok()
+        if self.running:
+            return self._thread
 
-        print("starting robot!")
+        self._stop_event.clear()
+        self._ready_event.clear()
+        self._loop_exception = None
+
         self.robot.start()
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, name="xense-franka-control", daemon=True)
+        self._thread.start()
 
-        if self.task is None or self.task.done():
-            self.task = asyncio.create_task(self._run())
-        await asyncio.sleep(1)  # Yield to ensure the task starts
-        return self.task
-    
+        start_deadline = time.time() + 2.0
+        while time.time() < start_deadline:
+            if self._ready_event.wait(timeout=0.05):
+                self._assert_loop_ok()
+                return self._thread
+            await asyncio.sleep(0)
+
+        self._assert_loop_ok()
+        raise TimeoutError("Timed out waiting for control loop to start")
+
     async def stop(self):
-        """
-        Stop the background control loop and robot.
-        
-        Gracefully terminates the control loop task and stops robot torque control.
-        Robot will hold position briefly then release brakes.
-        
-        Note:
-            - Blocks for 1 second to ensure clean shutdown
-            - Cancels asyncio control loop task
-            - Stops robot torque control mode
-            - Safe to call multiple times
-            
-        Example:
-            >>> await controller.start()
-            >>> # ... do control ...
-            >>> await controller.stop()
-            
-        Caveat:
-            Ensure robot is in a safe configuration before stopping. Robot
-            will briefly hold position then release brakes.
-        """
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
         self.running = False
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                print("Control loop task cancelled.") 
-
         self.robot.stop()
-        print("robot stopped")
-        await asyncio.sleep(1)  # Yield to ensure the task starts
+        await asyncio.sleep(0)
 
     def switch(self, controller_type: str):
-        """
-        Switch between control modes at runtime.
-        
-        Changes the active controller without stopping the control loop. Resets
-        the initial state (initial_qpos, initial_ee) to current robot state and
-        clears rate-limiting timing.
-        
-        Args:
-            controller_type (str): Controller type to switch to:
-                - "impedance": Joint-space impedance control
-                - "pid": Joint-space PID control with integral term
-                - "osc": Operational space control (task space)
-                - "torque": Direct torque control
-                
-        Example:
-            >>> controller.switch("impedance")
-            >>> controller.kp = np.ones(7) * 80
-            >>> # ... run impedance control ...
-            >>> 
-            >>> controller.switch("osc")
-            >>> controller.ee_kp = np.array([300, 300, 300, 1000, 1000, 1000])
-            >>> # ... run OSC control ...
-            
-        Note:
-            - Can be called while control loop is running
-            - Resets q_desired to current position
-            - Resets ee_desired to current end-effector pose
-            - Clears timing state from previous set() calls
-            - Resets integral term when switching to/from PID
-            
-        Caveats:
-            - Switching causes brief discontinuity in control
-            - Adjust gains after switching for smooth transition
-            - Don't switch rapidly (< 1 Hz) as it resets state
-        """
-        self.type = controller_type
-        self.initialize()
-        # Reset integral term when switching controllers
-        self.error_integral = np.zeros(7)
-        # Reset timing state when switching controllers
-        self._last_update_time.clear()
+        if controller_type not in {"impedance", "pid", "osc", "torque"}:
+            raise ValueError(f"Unknown controller type: {controller_type}")
+
+        with self.state_lock:
+            self.type = controller_type
+            self.initialize()
+            self.error_integral = np.zeros(7, dtype=float)
+            self._publish_next_deadline.clear()
+            self._sync_public_aliases()
 
         if self.verbose:
             print("==================================")
             print(f"Switched to {controller_type} controller.")
             print("==================================")
 
-    def step(self): 
-        self.state = self.robot.state
-        if self.type == "impedance":
-            self._impedance_step(self.state)
-        elif self.type == "pid":
-            self._pid_step(self.state)
-        elif self.type == "osc":
-            self._osc_step(self.state)
-        elif self.type == "torque":
-            self._torque_step(self.state)
-        else:
-            raise ValueError(f"Unknown controller type: {self.type}")
+    def _pid_step(self, state: dict, joint_ref: JointReference) -> np.ndarray:
+        q = state["qpos"]
+        dq = state["qvel"]
+        coriolis = state["coriolis"] if self.compensate_coriolis else np.zeros(7, dtype=float)
+        position_error = q - joint_ref.q
+        dt = max(float(state.get("dt", 1e-3)), 1e-6)
+        self.error_integral += (-position_error) * dt
+        self.error_integral = np.clip(self.error_integral, -self.integral_limit, self.integral_limit)
+        tau_task = (
+            -self.joint_gains.stiffness * position_error
+            + joint_ref.tau_ff
+            - self.joint_gains.damping * (dq - joint_ref.dq)
+        )
+        tau_task += 0.1 * self.error_integral
+        tau_d = tau_task + coriolis + self._compute_joint_limit_torque(q, dq)
+        return tau_d
 
-    def _torque_step(self, state):
+    def _impedance_step(self, state: dict, joint_ref: JointReference) -> np.ndarray:
+        q = state["qpos"]
+        dq = state["qvel"]
+        coriolis = state["coriolis"] if self.compensate_coriolis else np.zeros(7, dtype=float)
+        tau_task = (
+            self.joint_gains.stiffness * (joint_ref.q - q)
+            + self.joint_gains.damping * (joint_ref.dq - dq)
+            + joint_ref.tau_ff
+        )
+        tau_d = tau_task + coriolis + self._compute_joint_limit_torque(q, dq)
+        return tau_d
 
-        self.robot.step(self.torque)
+    def _osc_step(self, state: dict, cart_ref: CartesianReference) -> np.ndarray:
+        jac = state["jac"]
+        ee = state["ee"]
+        q = state["qpos"]
+        dq = state["qvel"]
+        coriolis = state["coriolis"] if self.compensate_coriolis else np.zeros(7, dtype=float)
 
-    def _osc_step(self, state): 
-        """
-        Operational Space Control (Cartesian impedance control).
-        
-        Uses the same implementation as pylibfranka_controllers for computing
-        Cartesian impedance torques with proper orientation error handling.
-        """
-        jac = state['jac']
-        ee = state['ee']
-        q = state['qpos']
-        dq = state['qvel']
-        mm = state['mm']
-        last_torque = state['last_torque']
-        coriolis = state['coriolis']
-
-        with self.state_lock:
-            ee_goal = self.ee_desired
-
-        # Current position and orientation
         position = ee[:3, 3]
         orientation = R.from_matrix(ee[:3, :3])
-        
-        # Desired position and orientation
-        position_d = ee_goal[:3, 3]
-        orientation_d = R.from_matrix(ee_goal[:3, :3])
+        target_position = cart_ref.pose[:3, 3]
+        target_orientation = R.from_matrix(cart_ref.pose[:3, :3])
 
-        # Compute 6D error
-        error = np.zeros(6)
-        error[:3] = position - position_d  # Position error
-        
-        # Orientation error using quaternion (same as pylibfranka_controllers)
-        orientation_quat = orientation.as_quat()  # [qx, qy, qz, qw]
-        orientation_d_quat = orientation_d.as_quat()
-        
-        # Handle quaternion sign ambiguity
-        if np.dot(orientation_d_quat, orientation_quat) < 0.0:
+        error = np.zeros(6, dtype=float)
+        error[:3] = np.clip(position - target_position, -self.cartesian_position_clip, self.cartesian_position_clip)
+
+        orientation_quat = orientation.as_quat()
+        target_quat = target_orientation.as_quat()
+        if np.dot(target_quat, orientation_quat) < 0.0:
             orientation_quat = -orientation_quat
-        
+
         orientation_corrected = R.from_quat(orientation_quat)
-        error_quaternion = orientation_corrected.inv() * orientation_d
-        error_quat = error_quaternion.as_quat()
-        error[3:] = error_quat[:3]  # Vector part of quaternion
-        error[3:] = -ee[:3, :3] @ error[3:]  # Transform to base frame
+        error_quaternion = orientation_corrected.inv() * target_orientation
+        error[3:] = error_quaternion.as_quat()[:3]
+        error[3:] = -ee[:3, :3] @ error[3:]
+        error[3:] = np.clip(error[3:], -self.cartesian_rotation_clip, self.cartesian_rotation_clip)
 
-        # Build stiffness and damping matrices
-        cartesian_stiffness = np.diag(self.ee_kp)
-        cartesian_damping = np.diag(self.ee_kd)
-        
-        # Compute task-space control torque (same as official pylibfranka_controllers)
-        tau_task = jac.T @ (-cartesian_stiffness @ error - 
-                           cartesian_damping @ (jac @ dq))
+        measured_twist = jac @ dq
+        wrench = -np.diag(self.cartesian_gains.stiffness) @ error
+        wrench -= np.diag(self.cartesian_gains.damping) @ (measured_twist - cart_ref.twist)
 
-        # Total torque with coriolis compensation
-        tau_d = tau_task + coriolis
+        tau_task = jac.T @ wrench
+        tau_nullspace = self._compute_nullspace_torque(jac, q, dq, cart_ref.nullspace_target)
+        tau_limit = self._compute_joint_limit_torque(q, dq)
+        return tau_task + tau_nullspace + tau_limit + coriolis
 
-        # Torque rate limiting
-        if self.clip:
-            diff = (tau_d - last_torque) / 1e-3
-            diff = np.clip(diff, -self.torque_diff_limit, self.torque_diff_limit)
-            tau_d = last_torque + diff * 1e-3
-
-        self.robot.step(tau_d)
-
-    
-
-
-    def _pid_step(self, robot_state):
-        """
-        PID control in joint space with integral term for steady-state error.
-        
-        Computes: τ = -Kp*(q - q_d) + Ki*∫e*dt - Kd*dq + coriolis
-        (Based on official impedance example with integral term)
-        """
-        # Get state variables
-        q = np.array(robot_state['qpos'])
-        dq = np.array(robot_state['qvel'])
-        last_torque = robot_state['last_torque']
-        coriolis = robot_state['coriolis']
-
-        # Get current target (thread-safe)
-        with self.state_lock:
-            kp = self.kp
-            ki = self.ki
-            kd = self.kd
-            q_goal = self.q_desired
-    
-        # Compute error (same convention as official example)
-        position_error = q - q_goal
-        
-        # Update integral term (dt = 1ms = 0.001s)
-        # Note: integral uses negative error for consistency
-        self.error_integral += (-position_error) * 1e-3
-        
-        # Anti-windup: clamp integral term
-        integral_limit = 10.0  # Nm*s (adjust as needed)
-        self.error_integral = np.clip(self.error_integral, -integral_limit, integral_limit)
-
-        # Compute PID control with coriolis compensation
-        tau_task = -kp * position_error + ki * self.error_integral - kd * dq
-        tau_d = tau_task + coriolis
-        
-        # Torque rate limiting
-        if self.clip:
-            diff = (tau_d - last_torque) / 1e-3
-            diff = np.clip(diff, -self.torque_diff_limit, self.torque_diff_limit)
-            tau_d = last_torque + diff * 1e-3
-
-        self.torque = tau_d
-        self.robot.step(tau_d)
-
-    def _impedance_step(self, robot_state): 
-        """
-        Joint-space impedance control with coriolis compensation.
-        
-        Computes: τ = -Kp*(q - q_d) - Kd*dq + coriolis
-        (Same as official joint_impedance_example.py)
-        """
-        # Get state variables
-        q = np.array(robot_state['qpos'])
-        dq = np.array(robot_state['qvel'])
-        last_torque = robot_state['last_torque']
-        coriolis = robot_state['coriolis']
-
-        # Get current target from trajectory (thread-safe)
-        with self.state_lock:
-            kp = self.kp
-            kd = self.kd
-            q_goal = self.q_desired
-    
-        # Compute error to desired equilibrium joint configuration
-        position_error = q - q_goal
-
-        # Compute joint-space impedance control (same as official example)
-        tau_task = -kp * position_error - kd * dq
-
-        # Add coriolis compensation
-        tau_d = tau_task + coriolis
-        
-        # Torque rate limiting
-        if self.clip:
-            diff = (tau_d - last_torque) / 1e-3
-            diff = np.clip(diff, -self.torque_diff_limit, self.torque_diff_limit)
-            tau_d = last_torque + diff * 1e-3
-            tau_d = np.clip(tau_d, -self.torque_limit, self.torque_limit)
-
-        self.torque = tau_d
-
-        self.robot.step(tau_d)
-
-
-    async def move(self, qpos = [0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, 0.7853],
-                   vel = np.ones(7) * 0.1,
-                   acc = np.ones(7) * 0.5):
-        """
-        Move robot to target joint position using smooth trajectory.
-        
-        Generates a time-optimal, jerk-limited trajectory using Ruckig online
-        trajectory generation, then executes it at 50 Hz. Automatically switches
-        to impedance mode if not already active.
-        
-        Args:
-            qpos (list | np.ndarray): Target joint positions [rad] (7,)
-                                     Default: Home position
-                                     
-        Note:
-            - Uses Ruckig for smooth, time-optimal trajectories
-            - Respects velocity, acceleration, and jerk limits
-            - Switches to impedance control automatically
-            - Executes trajectory at 50 Hz (20ms updates)
-            - Duration depends on distance and limits
-            
-        Trajectory Limits:
-            - Max velocity: 10 rad/s per joint
-            - Max acceleration: 5 rad/s² per joint
-            - Max jerk: 1 rad/s³ per joint
-            
-        Examples:
-            Move to home position:
-                >>> await controller.move()
-            
-            Move to custom position:
-                >>> target = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
-                >>> await controller.move(target)
-            
-            Move to current position + offset:
-                >>> current = controller.state['qpos']
-                >>> await controller.move(current + np.array([0.1, 0, 0, 0, 0, 0, 0]))
-                
-        Caveats:
-            - Large motions take longer (trajectory is time-optimal)
-            - Don't call while other control is active
-            - Blocks until motion completes
-            - Switches to impedance mode (resets controller state)
-            - May fail if target is at joint limits or in collision
-        """
+    async def move(
+        self,
+        qpos=None,
+        vel=np.ones(7, dtype=float) * 0.1,
+        acc=np.ones(7, dtype=float) * 0.5,
+    ):
+        self._assert_loop_ok()
         self.type = "impedance"
-        print("setting impedance controller for move...")
+
+        if qpos is None:
+            qpos = np.array([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, 0.7853], dtype=float)
 
         inp = InputParameter(7)
+        current_state = self.state if self.state is not None else self.robot.state
+        inp.current_position = current_state["qpos"]
+        inp.current_velocity = current_state["qvel"]
+        inp.current_acceleration = np.zeros(7, dtype=float)
 
-        print('getting current state for ruckig...')
-        inp.current_position = self.robot.state['qpos']
-        inp.current_velocity = self.robot.state['qvel']
-        print("got current state")
-        inp.current_acceleration = np.zeros(7)
+        inp.target_position = _as_array(qpos, 7)
+        inp.target_velocity = np.zeros(7, dtype=float)
+        inp.target_acceleration = np.zeros(7, dtype=float)
 
-        inp.target_position = np.array(qpos)
-        inp.target_velocity = np.zeros(7)
-        inp.target_acceleration = np.zeros(7)
+        inp.max_velocity = _as_array(vel, 7)
+        inp.max_acceleration = _as_array(acc, 7)
+        inp.max_jerk = np.ones(7, dtype=float)
 
-        inp.max_velocity = vel
-        inp.max_acceleration = acc
-        inp.max_jerk = np.ones(7)
-
-        print("set input parameters for ruckig")
-        
         otg = Ruckig(7)
         trajectory = Trajectory(7)
-
-        print("calculating trajectory...")
         result = otg.calculate(inp, trajectory)
+        if result not in {Result.Working, Result.Finished}:
+            raise RuntimeError(f"Ruckig trajectory generation failed: {result}")
 
-        print(f"Generated trajectory with result: {result}")
-        print(trajectory.duration * 50)
+        sample_hz = max(self._publish_freq, 50.0)
+        sample_dt = 1.0 / sample_hz
+        steps = max(int(np.ceil(trajectory.duration / sample_dt)), 1)
 
-        # create a trajectory to the desired qpos  (linear interpolation)
-        for i in range(int(trajectory.duration * 50)):
-            print(i, trajectory.duration * 50)
-            q_desired, _, _ = trajectory.at_time(i / 50.0)
-            await self.set("q_desired", q_desired)
+        for step in range(steps + 1):
+            t = min(step * sample_dt, trajectory.duration)
+            q_ref, dq_ref, _ = trajectory.at_time(t)
+            await self._rate_limit_publish("move_joint_reference", dt=sample_dt)
+            self._set_joint_reference(q=q_ref, dq=dq_ref)
 
-        # await self.stabilize()
+        self._set_joint_reference(q=inp.target_position, dq=np.zeros(7, dtype=float))
 
+    def get_current_ee_pose(self) -> np.ndarray:
+        if self.state is None:
+            return self.robot.state["ee"].copy()
+        return self.state["ee"].copy()
+
+    def get_current_joint_positions(self) -> np.ndarray:
+        if self.state is None:
+            return self.robot.state["qpos"].copy()
+        return self.state["qpos"].copy()
+
+    def get_current_joint_velocities(self) -> np.ndarray:
+        if self.state is None:
+            return self.robot.state["qvel"].copy()
+        return self.state["qvel"].copy()

@@ -1,8 +1,8 @@
 """
-xense_franka: Asyncio-based Franka Robot Control
+xense_franka: Async command API for Franka torque control.
 
-A high-level Python library for controlling Franka Emika robots using asyncio.
-Combines pylibfranka for real-time control with MuJoCo for kinematics/dynamics.
+The public API remains async-friendly, while the 1kHz impedance loop runs in a
+dedicated background thread.
 
 Main Components:
     RobotInterface: Low-level robot interface (real or simulation)
@@ -29,5 +29,5 @@ from xense_franka.controller import FrankaController
 from xense_franka.robot import RobotInterface
 from xense_franka.sync_controller import SyncFrankaController
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["RobotInterface", "FrankaController", "SyncFrankaController"]

@@ -1,6 +1,7 @@
 """
-同步接口封装，内部使用异步实现。
-允许用户不使用 async/await 语法控制机械臂。
+同步接口封装。
+
+控制循环在 FrankaController 的后台线程中运行；这里仅提供同步调用包装。
 """
 import asyncio
 import threading
@@ -150,11 +151,9 @@ class SyncFrankaController:
             mode: "osc" 或 "impedance"
         """
         if mode == "osc":
-            self._controller.ee_kp = kp
-            self._controller.ee_kd = kd
+            self._controller.set_cartesian_gains(kp, kd)
         else:
-            self._controller.kp = kp
-            self._controller.kd = kd
+            self._controller.set_joint_gains(kp, kd)
 
     def get_ee_pose(self) -> np.ndarray:
         """
@@ -163,8 +162,7 @@ class SyncFrankaController:
         Returns:
             4x4 齐次变换矩阵
         """
-        with self._controller.state_lock:
-            return self._controller.ee_desired.copy()
+        return self._controller.get_current_ee_pose()
 
     def get_state(self) -> dict:
         """
@@ -177,13 +175,11 @@ class SyncFrankaController:
 
     def get_joint_positions(self) -> np.ndarray:
         """获取当前关节位置"""
-        state = self._robot.state
-        return np.array(state['q'])
+        return self._controller.get_current_joint_positions()
 
     def get_joint_velocities(self) -> np.ndarray:
         """获取当前关节速度"""
-        state = self._robot.state
-        return np.array(state['dq'])
+        return self._controller.get_current_joint_velocities()
 
     def get_external_wrench(self) -> np.ndarray:
         """获取外部力/力矩"""
@@ -197,7 +193,7 @@ class SyncFrankaController:
         Args:
             pose: 4x4 齐次变换矩阵
         """
-        self._run_async(self._controller.set("ee_desired", pose))
+        self._run_async(self._controller.set_cartesian_reference(pose))
 
     def set_joint_positions(self, q: np.ndarray):
         """
@@ -206,7 +202,7 @@ class SyncFrankaController:
         Args:
             q: 7 个关节角度
         """
-        self._run_async(self._controller.set("q_desired", q))
+        self._run_async(self._controller.set_joint_reference(q))
 
     def move_delta(self, dx: float = 0, dy: float = 0, dz: float = 0,
                    drx: float = 0, dry: float = 0, drz: float = 0):
