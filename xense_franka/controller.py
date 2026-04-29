@@ -66,7 +66,7 @@ class FrankaController:
 
         self.compensate_coriolis = True
         self.joint_limit_repulsion_active = True
-        self.max_delta_tau = np.ones(7, dtype=float)
+        self.max_delta_tau = np.full(7, 0.5, dtype=float)
         self.torque_limit = FR3_TORQUE_LIMIT.copy()
         self.joint_limit_activation_distance = 0.1
         self.joint_limit_stiffness = 4.0
@@ -393,10 +393,15 @@ class FrankaController:
         loop_times = []
         last_time = time.perf_counter()
         iteration = 0
+        # Diagnostic ring buffer: last 5 ticks before crash
+        _diag_buf = []
+        _DIAG_SIZE = 5
 
         try:
             while not self._stop_event.is_set():
+                t_tick_start = time.perf_counter()
                 state = self.robot.read_control_state()
+                t_after_read = time.perf_counter()
 
                 # Update cached state (still behind state_lock for external readers)
                 with self.state_lock:
@@ -452,7 +457,24 @@ class FrankaController:
                     cart_ref=cart_ref,
                     direct_torque=direct_torque,
                 )
+                t_after_compute = time.perf_counter()
                 self.robot.step(tau_command)
+                t_after_step = time.perf_counter()
+
+                # Record diagnostic info
+                _diag_buf.append({
+                    "iter": iteration,
+                    "type": controller_type,
+                    "tau_cmd": tau_command.copy(),
+                    "tau_prev": state["last_torque"].copy(),
+                    "delta": (tau_command - state["last_torque"]).copy(),
+                    "t_read_ms": (t_after_read - t_tick_start) * 1000,
+                    "t_compute_ms": (t_after_compute - t_after_read) * 1000,
+                    "t_step_ms": (t_after_step - t_after_compute) * 1000,
+                    "t_total_ms": (t_after_step - t_tick_start) * 1000,
+                })
+                if len(_diag_buf) > _DIAG_SIZE:
+                    _diag_buf.pop(0)
 
                 if not self._ready_event.is_set():
                     self._ready_event.set()
@@ -475,7 +497,20 @@ class FrankaController:
                         print(f"  Min dt: {min_dt:.3f} ms, Max dt: {max_dt:.3f} ms")
                         print(f"  Jitter (max-min): {max_dt - min_dt:.3f} ms")
                         loop_times.clear()
+                else:
+                    iteration += 1
         except BaseException as exc:
+            # Print diagnostic ring buffer on crash
+            if _diag_buf:
+                print(f"\n===== CONTROL LOOP CRASH at iteration {iteration} =====")
+                for d in _diag_buf:
+                    print(f"  tick {d['iter']:6d} [{d['type']:>10s}] "
+                          f"total={d['t_total_ms']:.2f}ms "
+                          f"(read={d['t_read_ms']:.2f} compute={d['t_compute_ms']:.2f} step={d['t_step_ms']:.2f})")
+                    print(f"    tau_prev = {np.array2string(d['tau_prev'], precision=3, suppress_small=True)}")
+                    print(f"    tau_cmd  = {np.array2string(d['tau_cmd'], precision=3, suppress_small=True)}")
+                    print(f"    delta    = {np.array2string(d['delta'], precision=3, suppress_small=True)}")
+                print("===== END DIAGNOSTIC =====\n")
             self._loop_exception = exc
         finally:
             self.running = False
