@@ -194,38 +194,15 @@ controller.switch("torque")
 controller.torque = np.array([0, 0, 0, 0, 0, 0, 0.5])  # Nm
 ```
 
-## SyncFrankaController
-
-A convenience wrapper that manages `RobotInterface` + `FrankaController` lifecycle:
-
-```python
-from xense_franka import SyncFrankaController
-
-with SyncFrankaController("192.168.99.111") as ctrl:
-    ctrl.move()
-    ctrl.switch("osc")
-    ctrl.set_gains(
-        kp=np.array([600, 600, 600, 50, 50, 50]),
-        kd=2.0 * np.sqrt(np.array([600, 600, 600, 50, 50, 50])),
-        mode="osc",
-    )
-
-    for i in range(100):
-        ee = ctrl.get_ee_pose()
-        ee[:3, 3] += [0.001, 0, 0]
-        ctrl.set_ee_pose(ee)
-
-    ctrl.move_delta(dx=0.05)  # move 5cm in X
-```
-
 ## Trackers
 
 Trackers are context managers that handle mode switching and gain restore automatically:
 
 ```python
-from xense_franka import SyncFrankaController
+from xense_franka import RobotInterface, FrankaController
 
-with SyncFrankaController("192.168.99.111") as ctrl:
+robot = RobotInterface("192.168.99.111")
+with FrankaController(robot) as ctrl:
     ctrl.move()
 
     # Cartesian impedance tracker

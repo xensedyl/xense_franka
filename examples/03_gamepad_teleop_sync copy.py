@@ -1,6 +1,7 @@
-from xense_franka import SyncFrankaController
+from xense_franka import RobotInterface, FrankaController
 
-controller = SyncFrankaController("192.168.99.111")
+robot = RobotInterface("192.168.99.111")
+controller = FrankaController(robot)
 controller.start()
 controller.move([0, 0, 0, -1.57, 0, 1.57, 0.78])
 controller.switch("osc")

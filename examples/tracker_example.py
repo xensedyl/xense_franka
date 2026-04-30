@@ -10,14 +10,14 @@ Tracker 模式示例
 
 import time
 import numpy as np
-from xense_franka import SyncFrankaController
+from xense_franka import RobotInterface, FrankaController
 
 
 ROBOT_IP = "192.168.99.111"
 HOME_JOINTS = [0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, 0.7853]
 
 
-def demo_joint_tracker(ctrl: SyncFrankaController):
+def demo_joint_tracker(ctrl: FrankaController):
     """关节空间阻抗跟踪"""
     print("\n=== Joint Impedance Tracker ===")
     ctrl.move(HOME_JOINTS)
@@ -38,7 +38,7 @@ def demo_joint_tracker(ctrl: SyncFrankaController):
     print("Joint tracker done — gains and mode restored.")
 
 
-def demo_cartesian_tracker(ctrl: SyncFrankaController):
+def demo_cartesian_tracker(ctrl: FrankaController):
     """笛卡尔空间阻抗跟踪"""
     print("\n=== Cartesian Impedance Tracker ===")
     ctrl.move(HOME_JOINTS)
@@ -62,7 +62,7 @@ def demo_cartesian_tracker(ctrl: SyncFrankaController):
     print("Cartesian tracker done — gains and mode restored.")
 
 
-def demo_exponential_tracker(ctrl: SyncFrankaController):
+def demo_exponential_tracker(ctrl: FrankaController):
     """指数平滑运动"""
     print("\n=== Exponential Impedance Tracker ===")
     ctrl.move(HOME_JOINTS)
@@ -83,7 +83,8 @@ def demo_exponential_tracker(ctrl: SyncFrankaController):
 
 
 def main():
-    ctrl = SyncFrankaController(ROBOT_IP)
+    robot = RobotInterface(ROBOT_IP)
+    ctrl = FrankaController(robot)
     ctrl.start()
 
     try:

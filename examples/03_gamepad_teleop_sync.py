@@ -1,11 +1,10 @@
 """
 使用同步接口控制机械臂的手柄示例。
-不需要 async/await 语法。
 """
 import pygame
 import time
 import numpy as np
-from xense_franka import SyncFrankaController
+from xense_franka import RobotInterface, FrankaController
 
 
 def main():
@@ -21,8 +20,8 @@ def main():
     joystick.init()
     print(f"Gamepad connected: {joystick.get_name()}")
 
-    # 使用同步接口（可以使用 with 语句自动管理生命周期）
-    with SyncFrankaController("192.168.99.111") as controller:
+    robot = RobotInterface("192.168.99.111")
+    with FrankaController(robot) as controller:
         # 移动到初始位置
         controller.move([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, 0.7853])
         time.sleep(2.0)  # 等待机器人稳定
@@ -34,7 +33,7 @@ def main():
             kd=np.ones(6) * 10.0,
             mode="osc"
         )
-        controller.set_freq(30)  # 降低频率到 30Hz
+        # controller.set_freq(30)  # 降低频率到 30Hz
 
         print("Use gamepad to move the robot. Ctrl+C to exit.")
         print("  Left Stick: X/Y translation")
@@ -61,13 +60,14 @@ def main():
                 ry = 0 if abs(ry) < deadzone else ry
 
                 # 计算增量
-                dx = -ly * 0.002
-                dy = -lx * 0.002
-                dz = -ry * 0.002
-                drz = -rx * 0.3  # 度
+                dx = -ly * 0.02
+                dy = -lx * 0.02
+                dz = -ry * 0.00
+                drz = -rx * 0.0  # 度
 
                 # 只有有输入时才发送
                 if abs(dx) > 0 or abs(dy) > 0 or abs(dz) > 0 or abs(drz) > 0:
+                    print(f"Moving delta: dx={dx}, dy={dy}, dz={dz}, drz={drz}")
                     controller.move_delta(dx=dx, dy=dy, dz=dz, drz=drz)
 
                 # 固定 30Hz 循环

@@ -7,7 +7,6 @@ dedicated background thread.
 Main Components:
     RobotInterface: Low-level robot interface (real or simulation)
     FrankaController: High-level synchronous controller with multiple modes
-    SyncFrankaController: Convenience wrapper that manages robot + controller lifecycle
 
 Quick Example:
     >>> from xense_franka import RobotInterface, FrankaController
@@ -37,7 +36,6 @@ from xense_franka.references import (
     JointReference,
 )
 from xense_franka.robot import RobotInterface
-from xense_franka.sync_controller import SyncFrankaController
 from xense_franka.trackers import (
     CartesianImpedanceTracker,
     ExponentialImpedanceTracker,
@@ -49,7 +47,6 @@ __all__ = [
     # Core
     "RobotInterface",
     "FrankaController",
-    "SyncFrankaController",
     # Constants
     "FR3_JOINT_LIMITS_LOWER",
     "FR3_JOINT_LIMITS_UPPER",

@@ -32,6 +32,11 @@ from xense_franka.torque_utils import (
     pseudo_inverse,
     saturate_torque_rate,
 )
+from xense_franka.trackers import (
+    CartesianImpedanceTracker,
+    ExponentialImpedanceTracker,
+    JointImpedanceTracker,
+)
 
 
 class FrankaController:
@@ -81,8 +86,8 @@ class FrankaController:
         self.error_integral = np.zeros(7, dtype=float)
         self.integral_limit = 10.0
 
-        self._publish_freq = 50.0
-        self._publish_dt = 1.0 / self._publish_freq
+        self._publish_freq: Optional[float] = None
+        self._publish_dt: Optional[float] = None
         self._publish_next_deadline = {}
 
         self.state = None
@@ -329,16 +334,27 @@ class FrankaController:
         time.sleep(5.0)
         self.track = False
 
-    def set_freq(self, freq: float):
-        if freq <= 0:
-            raise ValueError("freq must be positive")
-        self._publish_freq = float(freq)
-        self._publish_dt = 1.0 / self._publish_freq
+    def set_freq(self, freq: Optional[float] = None):
+        """Set the publish rate limit for ``set`` / ``set_*_reference``.
+
+        Pass a positive number (Hz) to enable rate limiting, or ``None`` / ``0``
+        to disable it (commands are sent as fast as the caller can loop).
+        """
+        if freq is None or freq <= 0:
+            self._publish_freq = None
+            self._publish_dt = None
+        else:
+            self._publish_freq = float(freq)
+            self._publish_dt = 1.0 / self._publish_freq
         self._publish_next_deadline.clear()
 
     def _rate_limit_publish(self, key: str, dt: Optional[float] = None):
+        if dt is None:
+            dt = self._publish_dt
+        if dt is None:
+            return
         now = time.perf_counter()
-        dt = self._publish_dt if dt is None else float(dt)
+        dt = float(dt)
         deadline = self._publish_next_deadline.get(key)
         if deadline is None:
             self._publish_next_deadline[key] = now + dt
@@ -720,7 +736,7 @@ class FrankaController:
     def move(
         self,
         qpos=None,
-        vel=np.ones(7, dtype=float) * 0.1,
+        vel=np.ones(7, dtype=float) * 0.8,
         acc=np.ones(7, dtype=float) * 0.5,
     ):
         self._assert_loop_ok()
@@ -749,7 +765,7 @@ class FrankaController:
         if result not in {Result.Working, Result.Finished}:
             raise RuntimeError(f"Ruckig trajectory generation failed: {result}")
 
-        sample_hz = max(self._publish_freq, 50.0)
+        sample_hz = max(self._publish_freq or 50.0, 50.0)
         sample_dt = 1.0 / sample_hz
         steps = max(int(np.ceil(trajectory.duration / sample_dt)), 1)
 
@@ -779,3 +795,74 @@ class FrankaController:
         if self.state is None:
             return self.robot.state["qvel"].copy()
         return self.state["qvel"].copy()
+
+    # ------------------------------------------------------------------
+    # Convenience aliases
+    # ------------------------------------------------------------------
+
+    def get_ee_pose(self) -> np.ndarray:
+        return self.get_current_ee_pose()
+
+    def get_joint_positions(self) -> np.ndarray:
+        return self.get_current_joint_positions()
+
+    def get_joint_velocities(self) -> np.ndarray:
+        return self.get_current_joint_velocities()
+
+    def get_state(self) -> dict:
+        return self.robot.state
+
+    def get_external_wrench(self) -> np.ndarray:
+        state = self.robot.state
+        return np.array(state['ext_wrench'])
+
+    def set_ee_pose(self, pose: np.ndarray):
+        self.set_cartesian_reference(pose)
+
+    def set_joint_positions(self, q: np.ndarray):
+        self.set_joint_reference(q)
+
+    def set_gains(self, kp, kd=None, mode: str = "osc"):
+        if mode == "osc":
+            self.set_cartesian_gains(kp, kd)
+        else:
+            self.set_joint_gains(kp, kd)
+
+    def move_delta(self, dx: float = 0, dy: float = 0, dz: float = 0,
+                   drx: float = 0, dry: float = 0, drz: float = 0):
+        current_ee = self.get_current_ee_pose()
+        current_ee[:3, 3] += np.array([dx, dy, dz])
+        if drx != 0 or dry != 0 or drz != 0:
+            rotation_delta = R.from_euler('xyz', [drx, dry, drz], degrees=True).as_matrix()
+            current_ee[:3, :3] = rotation_delta @ current_ee[:3, :3]
+        self.set_cartesian_reference(current_ee)
+
+    # ------------------------------------------------------------------
+    # Tracker factories
+    # ------------------------------------------------------------------
+
+    def joint_tracker(self, stiffness=None, damping=None, damping_ratio: float = 1.0,
+                      restore_on_exit: bool = True) -> JointImpedanceTracker:
+        return JointImpedanceTracker(
+            self, stiffness=stiffness, damping=damping,
+            damping_ratio=damping_ratio, restore_on_exit=restore_on_exit,
+        )
+
+    def cartesian_tracker(self, stiffness=None, damping=None, damping_ratio: float = 1.0,
+                           nullspace_stiffness: Optional[float] = None,
+                           restore_on_exit: bool = True) -> CartesianImpedanceTracker:
+        return CartesianImpedanceTracker(
+            self, stiffness=stiffness, damping=damping,
+            damping_ratio=damping_ratio, nullspace_stiffness=nullspace_stiffness,
+            restore_on_exit=restore_on_exit,
+        )
+
+    def exponential_tracker(self, mode: str = "impedance", time_constant: float = 0.5,
+                             stiffness=None, damping=None, damping_ratio: float = 1.0,
+                             nullspace_stiffness: Optional[float] = None,
+                             restore_on_exit: bool = True) -> ExponentialImpedanceTracker:
+        return ExponentialImpedanceTracker(
+            self, mode=mode, time_constant=time_constant,
+            stiffness=stiffness, damping=damping, damping_ratio=damping_ratio,
+            nullspace_stiffness=nullspace_stiffness, restore_on_exit=restore_on_exit,
+        )
