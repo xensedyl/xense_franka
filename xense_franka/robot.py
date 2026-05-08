@@ -15,6 +15,7 @@ class RobotInterface:
     """
 
     def __init__(self, ip: str):
+        self.fci_ip = ip
         self.real = True
         self.torque_controller = None
         self._robot_state = None

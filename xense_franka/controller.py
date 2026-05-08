@@ -1,3 +1,5 @@
+import multiprocessing as _mp
+from multiprocessing.shared_memory import SharedMemory as _SharedMemory
 import threading
 import time
 from typing import Optional
@@ -37,6 +39,185 @@ from xense_franka.trackers import (
     ExponentialImpedanceTracker,
     JointImpedanceTracker,
 )
+
+
+# ---------------------------------------------------------------------------
+# Process-mode constants & helpers
+# ---------------------------------------------------------------------------
+_ST_N = 158  # state floats: qpos7+qvel7+tau7+wrench6+OT16+ee16+jac42+mm49+cor7+dt1
+_RF_N = 92   # ref   floats: type1+jref21+cref35+dtorque7+jgains14+cgains13+tc1
+_F64  = np.float64
+_TMAP = {"impedance": 0., "pid": 1., "osc": 2., "torque": 3.}
+_RMAP = {v: k for k, v in _TMAP.items()}
+
+def _pk_state(s, buf, slot):
+    b = buf[slot]
+    b[0:7]=s["qpos"]; b[7:14]=s["qvel"]; b[14:21]=s["last_torque"]
+    b[21:27]=s["ext_wrench"]; b[27:43]=s["O_T_EE"]; b[43:59]=s["ee"].ravel()
+    b[59:101]=s["jac"].ravel(); b[101:150]=s["mm"].ravel()
+    b[150:157]=s["coriolis"]; b[157]=s.get("dt",1e-3)
+
+def _upk_state(buf, slot):
+    b=buf[slot]
+    return dict(qpos=b[0:7].copy(),qvel=b[7:14].copy(),last_torque=b[14:21].copy(),
+                ext_wrench=b[21:27].copy(),O_T_EE=b[27:43].copy(),
+                ee=b[43:59].copy().reshape(4,4),jac=b[59:101].copy().reshape(6,7),
+                mm=b[101:150].copy().reshape(7,7),coriolis=b[150:157].copy(),dt=float(b[157]))
+
+
+def _control_process_worker(
+    fci_ip, st_name, rf_name, st_ctr, rf_ctr,
+    stop_ev, ready_ev, track,
+    comp_cor, jl_active, do_clip,
+    max_dtau, tau_lim,
+    jl_dist, jl_k, jl_d, jl_max,
+    lo_jl, up_jl, c_pos_clip, c_rot_clip,
+):
+    """1 kHz control loop in a dedicated process (independent GIL)."""
+    import os, sys, signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Main process handles Ctrl+C
+    try:
+        os.sched_setaffinity(0, {4, 5})
+    except OSError: pass
+    try:
+        os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(80))
+    except (OSError, PermissionError): pass
+
+    st_shm = rf_shm = None
+    _diag, _DS, it = [], 5, 0
+    try:
+        from xense_franka.robot import RobotInterface
+        from xense_franka.references import (
+            JointReference, CartesianReference,
+            JointImpedanceGains, CartesianImpedanceGains,
+        )
+        from xense_franka.torque_utils import (
+            compute_joint_limit_torque, saturate_torque_rate, pseudo_inverse,
+        )
+        from scipy.spatial.transform import Rotation as R
+
+        st_shm = _SharedMemory(name=st_name, create=False)
+        rf_shm = _SharedMemory(name=rf_name, create=False)
+        sb = np.ndarray((2,_ST_N), _F64, buffer=st_shm.buf)
+        rb = np.ndarray((2,_RF_N), _F64, buffer=rf_shm.buf)
+
+        robot = RobotInterface(ip=fci_ip)
+        robot.start()
+
+        ajg = JointImpedanceGains(); acg = CartesianImpedanceGains()
+        ei = np.zeros(7); last_rc = 0; ctype = "impedance"; gtc = 0.1
+        mdt = np.asarray(max_dtau); tlim = np.asarray(tau_lim)
+        ljl = np.asarray(lo_jl); ujl = np.asarray(up_jl)
+        cpc = np.asarray(c_pos_clip); crc = np.asarray(c_rot_clip)
+
+        # Defaults until first ref arrives
+        jref = None; cref = None; dtq = np.zeros(7)
+        tjg = JointImpedanceGains(); tcg = CartesianImpedanceGains()
+
+        ready_ev.set()
+
+        while not stop_ev.is_set():
+            t0 = time.perf_counter()
+            state = robot.read_control_state()
+            t1 = time.perf_counter()
+            dt = max(float(state.get("dt",1e-3)),1e-6)
+
+            ns = (st_ctr.value + 1) % 2
+            _pk_state(state, sb, ns)
+            st_ctr.value += 1
+
+            rc = rf_ctr.value
+            if rc > last_rc:
+                last_rc = rc
+                r = rb[(rc-1)%2].copy()
+                nt = _RMAP.get(r[0], "impedance")
+                if nt != ctype: ctype = nt; ei[:] = 0
+                jref = JointReference(q=r[1:8],dq=r[8:15],tau_ff=r[15:22])
+                cref = CartesianReference(pose=r[22:38].reshape(4,4),twist=r[38:44],
+                                          nullspace_target=r[50:57])
+                dtq = r[57:64].copy()
+                tjg = JointImpedanceGains(stiffness=r[64:71],damping=r[71:78])
+                tcg = CartesianImpedanceGains(stiffness=r[78:84],damping=r[84:90],
+                                              nullspace_stiffness=float(r[90]))
+                gtc = max(float(r[91]),1e-6)
+            elif jref is None:
+                jref = JointReference(q=state["qpos"].copy())
+                cref = CartesianReference(pose=state["ee"].copy())
+
+            a = 1.0 - np.exp(-dt/gtc) if gtc > 0 else 1.0
+            ajg.stiffness += a*(tjg.stiffness-ajg.stiffness)
+            ajg.damping   += a*(tjg.damping-ajg.damping)
+            acg.stiffness += a*(tcg.stiffness-acg.stiffness)
+            acg.damping   += a*(tcg.damping-acg.damping)
+            acg.nullspace_stiffness += a*(tcg.nullspace_stiffness-acg.nullspace_stiffness)
+
+            q=state["qpos"]; dq=state["qvel"]
+            cor = state["coriolis"] if comp_cor else np.zeros(7)
+
+            def _jlt():
+                return compute_joint_limit_torque(q,dq,ljl,ujl,jl_dist,jl_k,jl_d,jl_max) if jl_active else np.zeros(7)
+
+            if ctype == "torque":
+                td = dtq.copy()
+            elif ctype == "pid":
+                pe = q - jref.q; ei += (-pe)*dt; ei = np.clip(ei,-10,10)
+                td = -ajg.stiffness*pe + jref.tau_ff - ajg.damping*(dq-jref.dq) + 0.1*ei + cor + _jlt()
+            elif ctype == "osc":
+                jac=state["jac"]; ee=state["ee"]
+                pos=ee[:3,3]; ori=R.from_matrix(ee[:3,:3])
+                tp=cref.pose[:3,3]; to=R.from_matrix(cref.pose[:3,:3])
+                err=np.zeros(6); err[:3]=np.clip(pos-tp,-cpc,cpc)
+                oq=ori.as_quat(); tq=to.as_quat()
+                if np.dot(tq,oq)<0: oq=-oq
+                eq=(R.from_quat(oq).inv()*to).as_quat()[:3]
+                err[3:]=np.clip(-ee[:3,:3]@eq,-crc,crc)
+                mt=jac@dq
+                w=-np.diag(acg.stiffness)@err-np.diag(acg.damping)@(mt-cref.twist)
+                td=jac.T@w
+                nk=max(acg.nullspace_stiffness,0.)
+                if nk>0 and cref.nullspace_target is not None:
+                    nd=2*np.sqrt(nk); jtpi=pseudo_inverse(jac.T)
+                    td+=(np.eye(7)-jac.T@jtpi)@(nk*(cref.nullspace_target-q)-nd*dq)
+                td+=_jlt()+cor
+            else:
+                td=ajg.stiffness*(jref.q-q)+ajg.damping*(jref.dq-dq)+jref.tau_ff+cor+_jlt()
+
+            if do_clip: td=saturate_torque_rate(td,state["last_torque"],mdt)
+            td=np.clip(td,-tlim,tlim)
+            t2=time.perf_counter()
+            robot.step(td)
+            t3=time.perf_counter()
+
+            _diag.append(dict(iter=it,type=ctype,tau_cmd=td.copy(),
+                              tau_prev=state["last_torque"].copy(),
+                              delta=(td-state["last_torque"]).copy(),
+                              t_read_ms=(t1-t0)*1e3,t_compute_ms=(t2-t1)*1e3,
+                              t_step_ms=(t3-t2)*1e3,t_total_ms=(t3-t0)*1e3))
+            if len(_diag)>_DS: _diag.pop(0)
+            it+=1
+
+        robot.stop()
+    except KeyboardInterrupt:
+        pass  # Clean shutdown on Ctrl+C
+    except BaseException:
+        if _diag:
+            print(f"\n===== CONTROL LOOP CRASH at iteration {it} =====")
+            for d in _diag:
+                print(f"  tick {d['iter']:6d} [{d['type']:>10s}] total={d['t_total_ms']:.2f}ms "
+                      f"(read={d['t_read_ms']:.2f} compute={d['t_compute_ms']:.2f} step={d['t_step_ms']:.2f})")
+                print(f"    tau_prev = {np.array2string(d['tau_prev'],precision=3,suppress_small=True)}")
+                print(f"    tau_cmd  = {np.array2string(d['tau_cmd'],precision=3,suppress_small=True)}")
+                print(f"    delta    = {np.array2string(d['delta'],precision=3,suppress_small=True)}")
+            print("===== END DIAGNOSTIC =====\n")
+        import traceback; traceback.print_exc()
+        ready_ev.set()
+    finally:
+        try: robot.stop()
+        except: pass
+        for s in [st_shm, rf_shm]:
+            if s:
+                try: s.close()
+                except: pass
 
 
 class FrankaController:
@@ -108,6 +289,18 @@ class FrankaController:
         # already written fresh references to the handles.
         self._pending_transition: Optional[str] = None
 
+        # Process-mode attrs
+        self._process_mode = False
+        self._ctrl_process = None
+        self._ctrl_stop_ev = None
+        self._st_shm = None
+        self._rf_shm = None
+        self._st_view = None
+        self._rf_view = None
+        self._st_ctr = None
+        self._rf_ctr = None
+        self._rf_wc = 0
+
         self.initialize()
 
     @property
@@ -134,6 +327,7 @@ class FrankaController:
         gains = self._joint_gains_handle.get().copy()
         gains.stiffness = as_array(value, 7)
         self._joint_gains_handle.set(gains)
+        self._pub_ref()
 
     @property
     def kd(self) -> np.ndarray:
@@ -144,6 +338,7 @@ class FrankaController:
         gains = self._joint_gains_handle.get().copy()
         gains.damping = as_array(value, 7)
         self._joint_gains_handle.set(gains)
+        self._pub_ref()
 
     @property
     def ee_kp(self) -> np.ndarray:
@@ -154,6 +349,7 @@ class FrankaController:
         gains = self._cart_gains_handle.get().copy()
         gains.stiffness = as_array(value, 6)
         self._cart_gains_handle.set(gains)
+        self._pub_ref()
 
     @property
     def ee_kd(self) -> np.ndarray:
@@ -259,9 +455,11 @@ class FrankaController:
             twist=np.zeros(6, dtype=float),
             nullspace_target=state["qpos"].copy(),
         ))
+        self._pub_ref()
         # GIL-atomic: the control loop will see the new type only after the
         # handles above have been updated.
         self._pending_transition = controller_type
+        self._pub_ref()
 
     # ------------------------------------------------------------------
     # Public gain / reference setters
@@ -308,6 +506,7 @@ class FrankaController:
         else:
             tau_ff = as_array(tau_ff, 7)
         self._joint_ref_handle.set(JointReference(q=q, dq=dq, tau_ff=tau_ff))
+        self._pub_ref()
 
     def _set_cartesian_reference(self, pose, twist=None, nullspace_target=None):
         pose = pose_copy(pose)
@@ -366,6 +565,10 @@ class FrankaController:
         self._publish_next_deadline[key] = next_deadline
 
     def _assert_loop_ok(self):
+        if self._process_mode:
+            if self._ctrl_process is not None and not self._ctrl_process.is_alive():
+                raise RuntimeError("Control process terminated unexpectedly")
+            return
         if self._loop_exception is not None:
             raise RuntimeError("Control loop terminated unexpectedly") from self._loop_exception
 
@@ -389,6 +592,8 @@ class FrankaController:
         self._assert_loop_ok()
         self._rate_limit_publish("joint_reference")
         self._set_joint_reference(q=q, dq=dq, tau_ff=tau_ff)
+        self._pub_ref()
+
 
     def set_cartesian_reference(self, pose, twist=None, nullspace_target=None):
         self._assert_loop_ok()
@@ -398,12 +603,34 @@ class FrankaController:
     # ------------------------------------------------------------------
     # 1kHz control loop (lock-free)
     # ------------------------------------------------------------------
+        self._pub_ref()
+
 
     def _exp_smooth(self, current: np.ndarray, target: np.ndarray, dt: float) -> np.ndarray:
         if self.gains_time_constant <= 0.0:
             return target.copy()
         alpha = 1.0 - np.exp(-dt / self.gains_time_constant)
         return current + alpha * (target - current)
+
+    def _pub_ref(self):
+        if not self._process_mode or self._rf_view is None:
+            return
+        from xense_franka.references import CartesianReference
+        sl = (self._rf_wc + 1) % 2
+        b = self._rf_view[sl]
+        b[0] = _TMAP.get(self.effective_type, 0.)
+        jr = self._joint_ref_handle.get()
+        b[1:8]=jr.q; b[8:15]=jr.dq; b[15:22]=jr.tau_ff
+        cr = self._cart_ref_handle.get()
+        b[22:38]=cr.pose.ravel(); b[38:44]=cr.twist; b[44:50]=0.
+        b[50:57]=cr.nullspace_target if cr.nullspace_target is not None else 0.
+        b[57:64]=self.torque
+        jg=self._joint_gains_handle.get(); cg=self._cart_gains_handle.get()
+        b[64:71]=jg.stiffness; b[71:78]=jg.damping
+        b[78:84]=cg.stiffness; b[84:90]=cg.damping
+        b[90]=cg.nullspace_stiffness; b[91]=self.gains_time_constant
+        self._rf_wc += 1
+        self._rf_ctr.value = self._rf_wc
 
     def _loop(self):
         loop_times = []
@@ -651,20 +878,22 @@ class FrankaController:
     # Start / stop / switch
     # ------------------------------------------------------------------
 
-    def start(self):
+    def start(self, use_process: bool = True):
         self._assert_loop_ok()
         if self.running:
-            return self._thread
+            return self._thread or self._ctrl_process
 
         self._stop_event.clear()
         self._ready_event.clear()
         self._loop_exception = None
 
+        if use_process:
+            return self._start_process()
+
         self.robot.start()
         self.running = True
         self._thread = threading.Thread(target=self._loop, name="xense-franka-control", daemon=True)
         self._thread.start()
-
         try:
             if not self._ready_event.wait(timeout=2.0):
                 self._assert_loop_ok()
@@ -672,31 +901,80 @@ class FrankaController:
             self._assert_loop_ok()
             return self._thread
         except BaseException:
-            # Roll back: stop the control thread and release the FCI session.
+            self.stop()
+            raise
+
+    def _start_process(self):
+        ctx = _mp.get_context("spawn")
+        sb = 2*_ST_N*np.dtype(_F64).itemsize
+        rb = 2*_RF_N*np.dtype(_F64).itemsize
+        self._st_shm = _SharedMemory(create=True, size=sb)
+        self._rf_shm = _SharedMemory(create=True, size=rb)
+        self._st_view = np.ndarray((2,_ST_N), _F64, buffer=self._st_shm.buf)
+        self._rf_view = np.ndarray((2,_RF_N), _F64, buffer=self._rf_shm.buf)
+        self._st_ctr = ctx.Value("Q", 0, lock=False)
+        self._rf_ctr = ctx.Value("Q", 0, lock=False)
+        self._rf_wc = 0
+        self._ctrl_stop_ev = ctx.Event()
+        rdy = ctx.Event()
+        self._ctrl_process = ctx.Process(
+            target=_control_process_worker,
+            args=(
+                self.robot.fci_ip,
+                self._st_shm.name, self._rf_shm.name,
+                self._st_ctr, self._rf_ctr,
+                self._ctrl_stop_ev, rdy, self.track,
+                self.compensate_coriolis, self.joint_limit_repulsion_active,
+                self.clip, self.max_delta_tau.tolist(), self.torque_limit.tolist(),
+                self.joint_limit_activation_distance, self.joint_limit_stiffness,
+                self.joint_limit_damping, self.joint_limit_max_torque,
+                self.lower_joint_limits.tolist(), self.upper_joint_limits.tolist(),
+                self.cartesian_position_clip.tolist(), self.cartesian_rotation_clip.tolist(),
+            ),
+            daemon=True, name="xense-franka-ctrl",
+        )
+        self._process_mode = True
+        self.running = True
+        self._ctrl_process.start()
+        try:
+            if not rdy.wait(timeout=5.0):
+                raise TimeoutError("Control process failed to start within 5 s")
+            return self._ctrl_process
+        except BaseException:
             self.stop()
             raise
 
     def stop(self):
+        if self._process_mode:
+            return self._stop_process()
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             if self._thread.is_alive():
-                # Control thread is likely stuck in FCI I/O holding _io_lock.
-                # Calling robot.stop() would deadlock on the same lock, so we
-                # can only warn and let the daemon thread die with the process.
                 import warnings
                 warnings.warn(
                     "xense_franka: control thread did not exit within "
                     "timeout — robot.stop() skipped to avoid deadlock",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                self._thread = None
-                self.running = False
-                return
+                    RuntimeWarning, stacklevel=2)
+                self._thread = None; self.running = False; return
             self._thread = None
         self.running = False
         self.robot.stop()
+
+    def _stop_process(self):
+        if self._ctrl_stop_ev: self._ctrl_stop_ev.set()
+        if self._ctrl_process and self._ctrl_process.is_alive():
+            self._ctrl_process.join(timeout=3.0)
+            if self._ctrl_process.is_alive(): self._ctrl_process.terminate()
+        self._ctrl_process = None; self._ctrl_stop_ev = None
+        self._st_view = self._rf_view = None
+        for s in [self._st_shm, self._rf_shm]:
+            if s:
+                try: s.close(); s.unlink()
+                except: pass
+        self._st_shm = self._rf_shm = None
+        self._st_ctr = self._rf_ctr = None
+        self.running = False; self._process_mode = False
 
     def __enter__(self):
         self.start()
@@ -746,7 +1024,7 @@ class FrankaController:
             qpos = np.array([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, 0.7853], dtype=float)
 
         inp = InputParameter(7)
-        current_state = self.state if self.state is not None else self.robot.state
+        current_state = self.get_state()
         inp.current_position = current_state["qpos"]
         inp.current_velocity = current_state["qvel"]
         inp.current_acceleration = np.zeros(7, dtype=float)
@@ -782,19 +1060,13 @@ class FrankaController:
     # ------------------------------------------------------------------
 
     def get_current_ee_pose(self) -> np.ndarray:
-        if self.state is None:
-            return self.robot.state["ee"].copy()
-        return self.state["ee"].copy()
+        return self.get_state()["ee"].copy()
 
     def get_current_joint_positions(self) -> np.ndarray:
-        if self.state is None:
-            return self.robot.state["qpos"].copy()
-        return self.state["qpos"].copy()
+        return self.get_state()["qpos"].copy()
 
     def get_current_joint_velocities(self) -> np.ndarray:
-        if self.state is None:
-            return self.robot.state["qvel"].copy()
-        return self.state["qvel"].copy()
+        return self.get_state()["qvel"].copy()
 
     # ------------------------------------------------------------------
     # Convenience aliases
@@ -810,11 +1082,22 @@ class FrankaController:
         return self.get_current_joint_velocities()
 
     def get_state(self) -> dict:
+        if self._process_mode and self._st_ctr is not None:
+            # Wait for first state from control process (up to 2s)
+            if self._st_ctr.value == 0:
+                for _ in range(200):
+                    if self._st_ctr.value > 0:
+                        break
+                    time.sleep(0.01)
+            if self._st_ctr.value > 0:
+                s = _upk_state(self._st_view, (self._st_ctr.value - 1) % 2)
+                self.state = s
+                self.last_torque = s.get("last_torque")
+                return s
         return self.robot.state
 
     def get_external_wrench(self) -> np.ndarray:
-        state = self.robot.state
-        return np.array(state['ext_wrench'])
+        return self.get_state()['ext_wrench'].copy()
 
     def set_ee_pose(self, pose: np.ndarray):
         self.set_cartesian_reference(pose)
