@@ -1,0 +1,78 @@
+site_name: xense_franka
+site_description: Synchronous Python SDK for Franka FR3 torque control
+site_url: https://xensedyl.github.io/xense_franka/
+repo_url: https://github.com/xensedyl/xense_franka
+repo_name: xensedyl/xense_franka
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.tabs.link
+    - search.highlight
+    - search.suggest
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/weather-night
+        name: 切换到深色模式
+    - scheme: slate
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/weather-sunny
+        name: 切换到浅色模式
+
+nav:
+  - 首页: index.md
+  - 快速开始: quickstart.md
+  - 使用指南:
+      - 控制架构: guide/architecture.md
+      - 控制模式: guide/controllers.md
+      - Trackers: guide/trackers.md
+      - 安全与调试: guide/safety-debugging.md
+  - API:
+      - 总览: api/index.md
+      - RobotInterface: api/robot-interface.md
+      - FrankaController: api/franka-controller.md
+      - 数据结构: api/references.md
+      - Franka Desk 客户端: api/franka-client.md
+  - 示例: examples.md
+  - 迁移指南: migration.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search:
+      lang:
+        - zh
+        - en
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/xensedyl/xense_franka
+
+copyright: Copyright &copy; 2026 xense_franka contributors
